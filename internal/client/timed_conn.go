@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"net"
 	"paqet/internal/conf"
 	"paqet/internal/protocol"
 	"paqet/internal/socket"
@@ -30,6 +31,22 @@ func newTimedConn(ctx context.Context, cfg *conf.Conf) (*timedConn, error) {
 }
 
 func (tc *timedConn) createConn() (tnet.Conn, error) {
+	if tc.cfg.Transport.TCPCarrier {
+		srv := tc.cfg.Server.Addr
+		tcpAddr := &net.TCPAddr{IP: srv.IP, Port: srv.Port, Zone: srv.Zone}
+		pConn, err := socket.NewTCPClient(tc.ctx, tcpAddr)
+		if err != nil {
+			return nil, fmt.Errorf("could not create tcp-carrier conn: %w", err)
+		}
+		conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, pConn)
+		if err != nil {
+			return nil, err
+		}
+		// tcp_carrier has no client-side TCP flag negotiation — kernel
+		// owns those. Skip the PTCPF handshake message.
+		return conn, nil
+	}
+
 	netCfg := tc.cfg.Network
 	pConn, err := socket.New(tc.ctx, &netCfg)
 	if err != nil {

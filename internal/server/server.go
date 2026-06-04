@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -17,7 +18,7 @@ import (
 
 type Server struct {
 	cfg   *conf.Conf
-	pConn *socket.PacketConn
+	pConn net.PacketConn
 	wg    sync.WaitGroup
 }
 
@@ -40,9 +41,22 @@ func (s *Server) Start() error {
 		cancel()
 	}()
 
-	pConn, err := socket.New(ctx, &s.cfg.Network)
-	if err != nil {
-		return fmt.Errorf("could not create raw packet conn: %w", err)
+	var pConn net.PacketConn
+	if s.cfg.Transport.TCPCarrier {
+		tcpAddr := &net.TCPAddr{IP: s.cfg.Listen.Addr.IP, Port: s.cfg.Listen.Addr.Port}
+		tc, err := socket.NewTCPServer(ctx, tcpAddr)
+		if err != nil {
+			return fmt.Errorf("could not create tcp-carrier listener: %w", err)
+		}
+		pConn = tc
+		flog.Infof("Server started in tcp_carrier mode - listening for TCP on :%d", s.cfg.Listen.Addr.Port)
+	} else {
+		pc, err := socket.New(ctx, &s.cfg.Network)
+		if err != nil {
+			return fmt.Errorf("could not create raw packet conn: %w", err)
+		}
+		pConn = pc
+		flog.Infof("Server started - listening for packets on :%d", s.cfg.Listen.Addr.Port)
 	}
 	s.pConn = pConn
 
@@ -51,7 +65,6 @@ func (s *Server) Start() error {
 		return fmt.Errorf("could not start KCP listener: %w", err)
 	}
 	defer listener.Close()
-	flog.Infof("Server started - listening for packets on :%d", s.cfg.Listen.Addr.Port)
 
 	s.wg.Go(func() {
 		s.listen(ctx, listener)

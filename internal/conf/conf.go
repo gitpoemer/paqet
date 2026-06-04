@@ -81,20 +81,26 @@ func (c *Conf) validate() error {
 		}
 	}
 
-	allErrors = append(allErrors, c.Network.validate()...)
+	// Network validation only applies in pcap mode; tcp_carrier uses real
+	// kernel sockets that don't need an interface / IP / router MAC config.
+	if !c.Transport.TCPCarrier {
+		allErrors = append(allErrors, c.Network.validate()...)
+	}
 	allErrors = append(allErrors, c.Transport.validate()...)
 	if c.Role == "server" {
 		allErrors = append(allErrors, c.Listen.validate()...)
 	} else {
 		allErrors = append(allErrors, c.Server.validate()...)
-		if c.Server.Addr.IP.To4() != nil && c.Network.IPv4.Addr == nil {
-			allErrors = append(allErrors, fmt.Errorf("server address is IPv4, but the IPv4 interface is not configured"))
-		}
-		if c.Server.Addr.IP.To4() == nil && c.Network.IPv6.Addr == nil {
-			allErrors = append(allErrors, fmt.Errorf("server address is IPv6, but the IPv6 interface is not configured"))
-		}
-		if c.Transport.Conn > 1 && c.Network.Port != 0 {
-			allErrors = append(allErrors, fmt.Errorf("only one connection is allowed when a client port is explicitly set"))
+		if !c.Transport.TCPCarrier {
+			if c.Server.Addr != nil && c.Server.Addr.IP.To4() != nil && c.Network.IPv4.Addr == nil {
+				allErrors = append(allErrors, fmt.Errorf("server address is IPv4, but the IPv4 interface is not configured"))
+			}
+			if c.Server.Addr != nil && c.Server.Addr.IP.To4() == nil && c.Network.IPv6.Addr == nil {
+				allErrors = append(allErrors, fmt.Errorf("server address is IPv6, but the IPv6 interface is not configured"))
+			}
+			if c.Transport.Conn > 1 && c.Network.Port != 0 {
+				allErrors = append(allErrors, fmt.Errorf("only one connection is allowed when a client port is explicitly set"))
+			}
 		}
 	}
 	return writeErr(allErrors)

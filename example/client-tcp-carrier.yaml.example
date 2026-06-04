@@ -1,0 +1,47 @@
+# paqet Client Configuration Example — tcp_carrier mode
+#
+# Use this mode when the network path between client and server has stateful
+# middleboxes (mobile-carrier NAT/CGN, TCP performance-enhancement proxies)
+# that drop paqet's pcap-injected packets because the KCP sequence numbers
+# don't match the conntrack entries those middleboxes build from the
+# client's outbound SYN.
+#
+# tcp_carrier replaces the pcap-based packet transport with real kernel TCP
+# sockets. The KCP/smux/FEC/SOCKS5 stack above is unchanged. No iptables
+# rules are needed (the kernel owns the socket). Runs as an unprivileged
+# user (no CAP_NET_RAW / CAP_NET_ADMIN) provided the listen port is ≥ 1024.
+
+role: "client"
+
+log:
+  level: "info"
+
+socks5:
+  - listen: "127.0.0.1:1080"
+
+# `network` block is IGNORED in tcp_carrier mode — kept here only for
+# completeness. Safe to omit entirely.
+# network:
+#   interface: ""
+#   ipv4:
+#     addr: ""
+#     router_mac: ""
+
+server:
+  addr: "10.0.0.100:9999"   # CHANGE ME: paqet server address
+
+transport:
+  protocol: "kcp"
+  tcp_carrier: true          # ← THIS enables real-TCP carrier mode
+  conn: 4
+  kcp:
+    mode: "fast3"
+    block: "aes-128-gcm"
+    key: "your-secret-key-here"   # CHANGE ME: must match server
+    mtu: 1400
+    sndwnd: 2048
+    rcvwnd: 2048
+    smuxbuf: 16777216
+    streambuf: 8388608
+    dshard: 10
+    pshard: 3

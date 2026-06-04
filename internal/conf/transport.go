@@ -10,7 +10,12 @@ type Transport struct {
 	Conn     int    `yaml:"conn"`
 	TCPBuf   int    `yaml:"tcpbuf"`
 	UDPBuf   int    `yaml:"udpbuf"`
-	KCP      *KCP   `yaml:"kcp"`
+	// TCPCarrier switches the underlying packet transport from pcap-based
+	// raw-TCP injection to real kernel TCP sockets. Use when middleboxes on
+	// the path (carrier NAT/CGN, TCP PEPs) drop pcap-injected packets due to
+	// sequence-number mismatch with their conntrack entries.
+	TCPCarrier bool `yaml:"tcp_carrier"`
+	KCP        *KCP `yaml:"kcp"`
 }
 
 func (t *Transport) setDefaults(role string) {

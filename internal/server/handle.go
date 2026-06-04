@@ -3,11 +3,21 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 
+	"paqet/internal/conf"
 	"paqet/internal/flog"
 	"paqet/internal/protocol"
 	"paqet/internal/tnet"
 )
+
+// clientTCPFSetter is implemented by transports that support per-client TCP
+// flag overrides (the pcap-based socket.PacketConn). TCP carrier transports
+// don't have user-controllable flags, so the call becomes a no-op via the
+// interface assertion below.
+type clientTCPFSetter interface {
+	SetClientTCPF(net.Addr, []conf.TCPF)
+}
 
 func (s *Server) handleConn(ctx context.Context, conn tnet.Conn) {
 	for {
@@ -46,7 +56,9 @@ func (s *Server) handleStrm(ctx context.Context, strm tnet.Strm) error {
 		return s.handlePing(strm)
 	case protocol.PTCPF:
 		if len(p.TCPF) != 0 {
-			s.pConn.SetClientTCPF(strm.RemoteAddr(), p.TCPF)
+			if setter, ok := s.pConn.(clientTCPFSetter); ok {
+				setter.SetClientTCPF(strm.RemoteAddr(), p.TCPF)
+			}
 		}
 		return nil
 	case protocol.PTCP:

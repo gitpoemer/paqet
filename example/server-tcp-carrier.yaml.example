@@ -1,0 +1,35 @@
+# paqet Server Configuration Example — tcp_carrier mode
+#
+# Companion to client-tcp-carrier.yaml.example. See that file for context
+# on when to use this mode.
+
+role: "server"
+
+log:
+  level: "info"
+
+listen:
+  addr: ":9999"   # CHANGE ME: TCP port to listen on for paqet clients
+
+# `network` block is IGNORED in tcp_carrier mode — safe to omit entirely.
+
+transport:
+  protocol: "kcp"
+  tcp_carrier: true
+  conn: 4
+  kcp:
+    mode: "fast3"
+    block: "aes-128-gcm"
+    key: "your-secret-key-here"   # CHANGE ME: must match client
+    mtu: 1400
+    sndwnd: 2048
+    rcvwnd: 2048
+    smuxbuf: 16777216
+    streambuf: 8388608
+    dshard: 10
+    pshard: 3
+
+# Note: NO iptables rules are required on the server in tcp_carrier mode.
+# The kernel has a real TCP socket bound; it handles SYN-ACK and conntrack
+# normally. The NOTRACK + RST-drop rules required by paqet's classic pcap
+# mode exist only because pcap mode skips the kernel TCP stack entirely.

@@ -3,7 +3,6 @@ package kcp
 import (
 	"net"
 	"paqet/internal/conf"
-	"paqet/internal/socket"
 	"paqet/internal/tnet"
 
 	"github.com/xtaci/kcp-go/v5"
@@ -11,12 +10,14 @@ import (
 )
 
 type Listener struct {
-	packetConn *socket.PacketConn
+	packetConn net.PacketConn
 	cfg        *conf.KCP
 	listener   *kcp.Listener
 }
 
-func Listen(cfg *conf.KCP, pConn *socket.PacketConn) (tnet.Listener, error) {
+// Listen takes any net.PacketConn (the pcap-based socket.PacketConn for
+// classic mode, or socket.TCPConn for tcp_carrier mode) and serves KCP on it.
+func Listen(cfg *conf.KCP, pConn net.PacketConn) (tnet.Listener, error) {
 	l, err := kcp.ServeConn(cfg.Block, cfg.Dshard, cfg.Pshard, pConn)
 	if err != nil {
 		return nil, err

@@ -5,14 +5,15 @@ import (
 	"net"
 	"paqet/internal/conf"
 	"paqet/internal/flog"
-	"paqet/internal/socket"
 	"paqet/internal/tnet"
 
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )
 
-func Dial(addr *net.UDPAddr, cfg *conf.KCP, pConn *socket.PacketConn) (tnet.Conn, error) {
+// Dial accepts any net.PacketConn (pcap-based socket.PacketConn for classic
+// mode, socket.TCPConn for tcp_carrier mode).
+func Dial(addr *net.UDPAddr, cfg *conf.KCP, pConn net.PacketConn) (tnet.Conn, error) {
 	conn, err := kcp.NewConn(addr.String(), cfg.Block, cfg.Dshard, cfg.Pshard, pConn)
 	if err != nil {
 		return nil, fmt.Errorf("connection attempt failed: %v", err)
