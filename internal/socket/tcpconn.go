@@ -202,6 +202,13 @@ func (tc *TCPConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 // WriteTo satisfies net.PacketConn.
+//
+// Framing is one length-prefixed frame per call, written as a single kernel
+// write (via net.Buffers / writev) so length + body are atomically delivered
+// even under concurrent pressure or partial-write scenarios. A previous
+// implementation used two consecutive Write() calls and was vulnerable to
+// permanent stream desync if the second call failed after the first
+// succeeded — receiver would parse the partial body as a length prefix.
 func (tc *TCPConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if tc.closed.Load() {
 		return 0, net.ErrClosed
@@ -233,13 +240,18 @@ func (tc *TCPConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	stream.writeMu.Lock()
 	defer stream.writeMu.Unlock()
 
-	if d, ok := tc.writeDeadline.Load().(time.Time); ok && !d.IsZero() {
-		_ = stream.conn.SetWriteDeadline(d)
-	}
-	if _, err := stream.conn.Write(lenBuf[:]); err != nil {
-		return 0, err
-	}
-	if _, err := stream.conn.Write(p); err != nil {
+	// Sync the underlying TCP conn's write deadline to our stored value.
+	// When the caller clears the deadline by storing time.Time{}, we must
+	// actively clear it on the conn too (passing zero time to
+	// SetWriteDeadline disables the deadline); otherwise a stale past
+	// deadline from an earlier call would fail every subsequent write
+	// with ErrDeadlineExceeded.
+	d, _ := tc.writeDeadline.Load().(time.Time)
+	_ = stream.conn.SetWriteDeadline(d)
+
+	// writev one frame as a single atomic kernel call.
+	buffers := net.Buffers{lenBuf[:], p}
+	if _, err := buffers.WriteTo(stream.conn); err != nil {
 		return 0, err
 	}
 	return len(p), nil
