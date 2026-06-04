@@ -1,0 +1,47 @@
+# paqet Client Configuration Example — handshake_cycle mode
+#
+# Each KCP packet rides inside a fresh fake-TCP handshake cycle. On the wire
+# the carrier sees a stream of short legitimate-looking TCP connections, one
+# per KCP packet, with rotating source ports. The goal is to defeat carrier
+# DPI / TCP optimizers that engage on long-lived non-standard-protocol flows.
+#
+# Wire pattern per cycle (4 packets per KCP packet):
+#   client [S]   → server   (carrier: NEW conntrack)
+#   server [SA]  → client
+#   client [PA]  → server   (carries KCP packet body)
+#   server [A]   → client   (may carry server's queued KCP response data)
+# Then the cycle is abandoned and the carrier conntrack times out.
+
+role: "client"
+
+log:
+  level: "info"
+
+socks5:
+  - listen: "127.0.0.1:1080"
+
+# Network block IS required in handshake_cycle mode (still uses pcap).
+# The TCP flag fields (network.tcp.local_flag / remote_flag) are IGNORED
+# because the cycle state machine drives flags per packet.
+network:
+  interface: "eth0"
+  ipv4:
+    addr: "192.168.1.100:0"           # CHANGE ME — local IP
+    router_mac: "aa:bb:cc:dd:ee:ff"   # CHANGE ME — gateway MAC
+
+server:
+  addr: "1.2.3.4:9443"   # CHANGE ME — server addr
+
+transport:
+  protocol: "kcp"
+  mode: "handshake_cycle"     # ← THIS enables the cycle mode
+  conn: 1                     # KCP-level connection count (keep at 1 in cycle mode)
+  kcp:
+    mode: "fast3"
+    block: "aes-128-gcm"
+    key: "your-secret-key"
+    mtu: 1400
+
+# Iptables required on this host (drop kernel RSTs for unbound rotating ports):
+#   sudo iptables -t mangle -A OUTPUT -p tcp -d <SERVER_IP> --dport 9443 \
+#       --tcp-flags RST RST -j DROP

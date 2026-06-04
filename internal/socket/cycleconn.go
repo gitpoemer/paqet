@@ -1,0 +1,718 @@
+package socket
+
+// cycleconn.go — handshake_cycle transport mode.
+//
+// Each KCP packet on the wire rides inside a fresh fake-TCP handshake cycle:
+//
+//   client                                                       server
+//     |                                                             |
+//     |  [S]   seq=X                                                |
+//     | ──────────────────────────────────────────────────────────► | (carrier: new conntrack NEW→SYN_SENT)
+//     |                                                             |
+//     |  [SA]  seq=Y, ack=X+1                                       |
+//     | ◄────────────────────────────────────────────────────────── | (carrier: SYN_RECV)
+//     |                                                             |
+//     |  [PA]  seq=X+1, ack=Y+1, payload=<KCP packet>               |
+//     | ──────────────────────────────────────────────────────────► | (carrier: ESTABLISHED + data flow)
+//     |                                                             |
+//     |  [PA]  seq=Y+1, ack=X+1+N, payload=<server's queued data>   |
+//     |        (or [A] with no payload if nothing to send)          |
+//     | ◄────────────────────────────────────────────────────────── |
+//     |                                                             |
+//   (carrier conntrack times out the ESTABLISHED entry on idle;     )
+//   (we don't bother with explicit FIN — saves wire packets and     )
+//   (matches how some real apps abandon idle conns                  )
+//
+// Goal: make the wire pattern look like a stream of short legitimate-looking
+// TCP connections rather than one long-lived weird one, defeating carrier
+// DPI / TCP optimizers that engage on suspicious persistent flows.
+//
+// Source ports on the client side rotate from a 15k-port pool per packet so
+// the carrier sees each cycle as a distinct connection. Server is identified
+// by a fixed listen port (the configured cfg.Listen / cfg.Server port).
+//
+// KCP server demux: synthetic *net.UDPAddr keyed only by client_ip (port=0)
+// so KCP sees one session per source IP regardless of the rotating ports.
+// Limitation: multiple paqet clients sharing one source IP (uncommon) would
+// collapse into one KCP session.
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"fmt"
+	mrand "math/rand/v2"
+	"net"
+	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"paqet/internal/conf"
+	"paqet/internal/flog"
+
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcap"
+)
+
+const (
+	cyclePoolBase  uint16 = 50000
+	cyclePoolSize  uint16 = 15000 // ports 50000..64999
+	cycleQueueCap         = 2048
+	cycleTimeout          = 5 * time.Second
+	cycleMaxPacket        = 65535
+)
+
+// cycleState marks how far the per-cycle TCP-mimic handshake has progressed.
+type cycleState uint8
+
+const (
+	cycleInit          cycleState = iota
+	cycleSynSent                  // client sent S, waiting for SA
+	cycleSynReceived              // server received S, sent SA
+	cycleEstablished              // handshake complete
+	cycleDataDelivered            // payload received
+	cycleClosed
+)
+
+// cycle holds per-handshake state on either side.
+//
+// On the CLIENT side, keyed by local src_port we picked.
+// On the SERVER side, keyed by "<client_ip>:<client_src_port>".
+type cycle struct {
+	srcIP   net.IP // local IP for client; remote (client) IP for server
+	srcPort uint16
+	dstIP   net.IP
+	dstPort uint16
+
+	ourSeq   uint32 // next seq we'll use when sending
+	theirSeq uint32 // last seq we saw from peer
+
+	state cycleState
+
+	// Payload queued for sending. On client side this is the KCP packet
+	// staged for the [PA] step. On server side this is the KCP packet that
+	// the server's KCP layer wants to send back on this cycle's [PA] ACK.
+	pending []byte
+
+	expires time.Time
+}
+
+func (c *cycle) key() string {
+	return cycleKey(c.srcIP, c.srcPort)
+}
+
+func cycleKey(ip net.IP, port uint16) string {
+	return fmt.Sprintf("%s:%d", ip.String(), port)
+}
+
+// CycleConn implements net.PacketConn for the handshake_cycle transport.
+type CycleConn struct {
+	cfg      *conf.Network
+	isServer bool
+
+	sendHandle *pcap.Handle
+	recvHandle *pcap.Handle
+
+	srcMAC net.HardwareAddr
+	dstMAC net.HardwareAddr
+	srcIP  net.IP // local IP
+
+	// Client-only: the remote we're dialing.
+	serverAddr *net.UDPAddr
+
+	// Server-only: the port we listen on.
+	listenPort uint16
+
+	// Cycle state.
+	cyclesMu sync.Mutex
+	cycles   map[string]*cycle
+
+	// Client-only: port pool cursor (atomic for cheap allocation).
+	portCursor atomic.Uint32
+
+	// Outbound queue per client_ip on the SERVER side. When server's KCP
+	// hands us a packet via WriteTo, we stash it here until the next
+	// incoming cycle from that IP reaches its PA stage.
+	serverOutMu sync.Mutex
+	serverOut   map[string][][]byte // ip-string → []packet
+
+	// Receive queue (delivered KCP packet bodies).
+	readQueue chan readPacket
+
+	// Debug counters.
+	writeCount atomic.Uint64
+	readCount  atomic.Uint64
+
+	readDeadline  atomic.Value
+	writeDeadline atomic.Value
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	closed atomic.Bool
+}
+
+// NewCycleServer creates a handshake_cycle PacketConn in server mode.
+func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, true, listenPort, nil)
+	if err != nil {
+		return nil, err
+	}
+	go cc.recvLoop()
+	go cc.cycleSweeper()
+	return cc, nil
+}
+
+// NewCycleClient creates a handshake_cycle PacketConn in client mode.
+func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, false, 0, serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	// Seed the port cursor to a random offset so two cycle clients on the
+	// same host don't always pick the same first port.
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	cc.portCursor.Store(binary.BigEndian.Uint32(b[:]))
+	go cc.recvLoop()
+	go cc.cycleSweeper()
+	return cc, nil
+}
+
+func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, listenPort uint16, serverAddr *net.UDPAddr) (*CycleConn, error) {
+	sendH, err := openCyclePcap(cfg, pcap.DirectionOut)
+	if err != nil {
+		return nil, fmt.Errorf("cycle: open send pcap: %w", err)
+	}
+	recvH, err := openCyclePcap(cfg, pcap.DirectionIn)
+	if err != nil {
+		sendH.Close()
+		return nil, fmt.Errorf("cycle: open recv pcap: %w", err)
+	}
+
+	var filter string
+	if isServer {
+		filter = fmt.Sprintf("tcp and dst port %d", listenPort)
+	} else {
+		// On client side, capture everything from the server's IP+port
+		// regardless of which local port we sent from (rotating).
+		filter = fmt.Sprintf("tcp and src host %s and src port %d", serverAddr.IP.String(), serverAddr.Port)
+	}
+	if err := recvH.SetBPFFilter(filter); err != nil {
+		sendH.Close()
+		recvH.Close()
+		return nil, fmt.Errorf("cycle: set BPF %q: %w", filter, err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	cc := &CycleConn{
+		cfg:        cfg,
+		isServer:   isServer,
+		sendHandle: sendH,
+		recvHandle: recvH,
+		srcMAC:     cfg.Interface.HardwareAddr,
+		serverAddr: serverAddr,
+		listenPort: listenPort,
+		cycles:     make(map[string]*cycle),
+		serverOut:  make(map[string][][]byte),
+		readQueue:  make(chan readPacket, cycleQueueCap),
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+	if cfg.IPv4.Addr != nil {
+		cc.srcIP = cfg.IPv4.Addr.IP
+		cc.dstMAC = cfg.IPv4.Router
+	}
+	if cc.srcIP == nil {
+		// Server tcp_carrier mode-like case where we accept any client IP
+		// but still need an outgoing src for crafting responses. Fall back
+		// to the first IPv4 on the interface.
+		addrs, _ := cfg.Interface.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLoopback() {
+				cc.srcIP = ipn.IP.To4()
+				break
+			}
+		}
+	}
+	if cc.srcIP == nil {
+		recvH.Close()
+		sendH.Close()
+		cancel()
+		return nil, fmt.Errorf("cycle: could not determine source IPv4 on %s", cfg.Interface.Name)
+	}
+	if cc.dstMAC == nil {
+		recvH.Close()
+		sendH.Close()
+		cancel()
+		return nil, fmt.Errorf("cycle: gateway MAC required (network.ipv4.router_mac)")
+	}
+	return cc, nil
+}
+
+func openCyclePcap(cfg *conf.Network, dir pcap.Direction) (*pcap.Handle, error) {
+	ifaceName := cfg.Interface.Name
+	if runtime.GOOS == "windows" {
+		ifaceName = cfg.GUID
+	}
+	inactive, err := pcap.NewInactiveHandle(ifaceName)
+	if err != nil {
+		return nil, err
+	}
+	defer inactive.CleanUp()
+	_ = inactive.SetBufferSize(cfg.PCAP.Sockbuf)
+	_ = inactive.SetSnapLen(65536)
+	_ = inactive.SetPromisc(true)
+	_ = inactive.SetTimeout(pcap.BlockForever)
+	_ = inactive.SetImmediateMode(true)
+	h, err := inactive.Activate()
+	if err != nil {
+		return nil, err
+	}
+	if runtime.GOOS != "windows" {
+		_ = h.SetDirection(dir)
+	}
+	return h, nil
+}
+
+// allocPort returns the next source port from the rotating pool.
+func (c *CycleConn) allocPort() uint16 {
+	for range int(cyclePoolSize) {
+		idx := c.portCursor.Add(1)
+		port := cyclePoolBase + uint16(idx%uint32(cyclePoolSize))
+		c.cyclesMu.Lock()
+		_, busy := c.cycles[cycleKey(c.srcIP, port)]
+		c.cyclesMu.Unlock()
+		if !busy {
+			return port
+		}
+	}
+	// Last resort: just pick a random port and hope.
+	return cyclePoolBase + uint16(mrand.IntN(int(cyclePoolSize)))
+}
+
+// =====================================================================
+//  net.PacketConn interface
+// =====================================================================
+
+func (c *CycleConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	var deadlineCh <-chan time.Time
+	if d, ok := c.readDeadline.Load().(time.Time); ok && !d.IsZero() {
+		timer := time.NewTimer(time.Until(d))
+		defer timer.Stop()
+		deadlineCh = timer.C
+	}
+	select {
+	case <-c.ctx.Done():
+		return 0, nil, net.ErrClosed
+	case <-deadlineCh:
+		return 0, nil, os.ErrDeadlineExceeded
+	case pkt := <-c.readQueue:
+		return copy(p, pkt.data), pkt.addr, nil
+	}
+}
+
+func (c *CycleConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	if len(p) > cycleMaxPacket {
+		return 0, fmt.Errorf("cycle: packet %d > max %d", len(p), cycleMaxPacket)
+	}
+	if c.isServer {
+		return c.serverWriteTo(p, addr)
+	}
+	return c.clientWriteTo(p, addr)
+}
+
+func (c *CycleConn) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	c.cancel()
+	if c.sendHandle != nil {
+		c.sendHandle.Close()
+	}
+	if c.recvHandle != nil {
+		c.recvHandle.Close()
+	}
+	return nil
+}
+
+func (c *CycleConn) LocalAddr() net.Addr {
+	if c.isServer {
+		return &net.UDPAddr{IP: c.srcIP, Port: int(c.listenPort)}
+	}
+	return &net.UDPAddr{IP: c.srcIP, Port: 0}
+}
+
+func (c *CycleConn) SetDeadline(t time.Time) error {
+	c.readDeadline.Store(t)
+	c.writeDeadline.Store(t)
+	return nil
+}
+func (c *CycleConn) SetReadDeadline(t time.Time) error  { c.readDeadline.Store(t); return nil }
+func (c *CycleConn) SetWriteDeadline(t time.Time) error { c.writeDeadline.Store(t); return nil }
+func (c *CycleConn) SetDSCP(int) error                  { return nil }
+func (c *CycleConn) SetClientTCPF(net.Addr, []conf.TCPF) {}
+
+var _ net.PacketConn = (*CycleConn)(nil)
+
+// =====================================================================
+//  Client-side: WriteTo kicks off a new handshake cycle
+// =====================================================================
+
+func (c *CycleConn) clientWriteTo(p []byte, addr net.Addr) (int, error) {
+	srcPort := c.allocPort()
+	dstIP := c.serverAddr.IP
+	dstPort := uint16(c.serverAddr.Port)
+
+	var seqBytes [4]byte
+	_, _ = rand.Read(seqBytes[:])
+	ourSeq := binary.BigEndian.Uint32(seqBytes[:])
+
+	cy := &cycle{
+		srcIP:   c.srcIP,
+		srcPort: srcPort,
+		dstIP:   dstIP,
+		dstPort: dstPort,
+		ourSeq:  ourSeq,
+		state:   cycleSynSent,
+		pending: append([]byte(nil), p...),
+		expires: time.Now().Add(cycleTimeout),
+	}
+
+	c.cyclesMu.Lock()
+	c.cycles[cy.key()] = cy
+	c.cyclesMu.Unlock()
+
+	if err := c.sendTCP(cy, tcpFlagsSYN, nil); err != nil {
+		c.dropCycle(cy)
+		return 0, err
+	}
+	wc := c.writeCount.Add(1)
+	if wc <= 5 || wc%500 == 0 {
+		flog.Debugf("cycle/client: cycle started srcPort=%d wc=%d kcpLen=%d", srcPort, wc, len(p))
+	}
+	return len(p), nil
+}
+
+// =====================================================================
+//  Server-side: WriteTo queues data for the next inbound cycle from this client
+// =====================================================================
+
+func (c *CycleConn) serverWriteTo(p []byte, addr net.Addr) (int, error) {
+	uaddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return 0, fmt.Errorf("cycle/server: WriteTo expects *net.UDPAddr, got %T", addr)
+	}
+	key := uaddr.IP.String()
+	c.serverOutMu.Lock()
+	c.serverOut[key] = append(c.serverOut[key], append([]byte(nil), p...))
+	c.serverOutMu.Unlock()
+	wc := c.writeCount.Add(1)
+	if wc <= 5 || wc%500 == 0 {
+		flog.Debugf("cycle/server: queued outbound for %s wc=%d kcpLen=%d", key, wc, len(p))
+	}
+	return len(p), nil
+}
+
+func (c *CycleConn) popServerOut(ipKey string) []byte {
+	c.serverOutMu.Lock()
+	defer c.serverOutMu.Unlock()
+	q := c.serverOut[ipKey]
+	if len(q) == 0 {
+		return nil
+	}
+	out := q[0]
+	c.serverOut[ipKey] = q[1:]
+	return out
+}
+
+// =====================================================================
+//  Receive loop: parse pcap-captured packets and run the state machine
+// =====================================================================
+
+func (c *CycleConn) recvLoop() {
+	for {
+		if c.closed.Load() {
+			return
+		}
+		data, _, err := c.recvHandle.ReadPacketData()
+		if err != nil {
+			if c.closed.Load() {
+				return
+			}
+			flog.Debugf("cycle: recv error: %v", err)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		pkt := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
+		ipL := pkt.NetworkLayer()
+		if ipL == nil {
+			continue
+		}
+		var srcIP, dstIP net.IP
+		switch v := ipL.(type) {
+		case *layers.IPv4:
+			srcIP = v.SrcIP
+			dstIP = v.DstIP
+		default:
+			continue
+		}
+		tcpL, ok := pkt.TransportLayer().(*layers.TCP)
+		if !ok {
+			continue
+		}
+		c.handleIncoming(srcIP, dstIP, tcpL, pkt.ApplicationLayer())
+	}
+}
+
+func (c *CycleConn) handleIncoming(srcIP, dstIP net.IP, t *layers.TCP, app gopacket.ApplicationLayer) {
+	var payload []byte
+	if app != nil {
+		payload = app.Payload()
+	}
+	if c.isServer {
+		c.handleIncomingServer(srcIP, t, payload)
+	} else {
+		c.handleIncomingClient(srcIP, t, payload)
+	}
+}
+
+func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []byte) {
+	// On client, key by our local port (the dst port of incoming packet).
+	key := cycleKey(c.srcIP, uint16(t.DstPort))
+	c.cyclesMu.Lock()
+	cy, exists := c.cycles[key]
+	c.cyclesMu.Unlock()
+	if !exists {
+		// Stray packet for a cycle we no longer track (already swept or
+		// brand new SYN from an attacker). Ignore.
+		return
+	}
+	cy.theirSeq = t.Seq
+
+	switch {
+	case t.SYN && t.ACK:
+		// [SA] — handshake completing. Respond with [PA] carrying the
+		// payload we stashed when WriteTo was called.
+		cy.ourSeq = t.Ack // server expects this as our next seq
+		cy.state = cycleEstablished
+		if cy.pending != nil {
+			if err := c.sendTCP(cy, tcpFlagsPSHACK, cy.pending); err != nil {
+				flog.Debugf("cycle/client: PA send failed for srcPort=%d: %v", cy.srcPort, err)
+				c.dropCycle(cy)
+				return
+			}
+			cy.ourSeq += uint32(len(cy.pending))
+			cy.pending = nil
+			cy.state = cycleDataDelivered
+		}
+
+	case t.PSH && t.ACK && len(payload) > 0:
+		// [PA] from server with data — server's response. Deliver UP to
+		// KCP via the read queue. KCP doesn't care about TCP semantics;
+		// it just wants the packet body.
+		c.deliverRead(payload, c.serverAddr)
+		// We won't send any further packets on this cycle.
+
+	case t.ACK && !t.SYN && len(payload) == 0:
+		// Bare ACK from server. Nothing to do.
+
+	case t.RST:
+		c.dropCycle(cy)
+	}
+}
+
+func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []byte) {
+	key := cycleKey(srcIP, uint16(t.SrcPort))
+	c.cyclesMu.Lock()
+	cy, exists := c.cycles[key]
+	c.cyclesMu.Unlock()
+
+	switch {
+	case t.SYN && !t.ACK:
+		// New cycle initiated by client.
+		var seqBytes [4]byte
+		_, _ = rand.Read(seqBytes[:])
+		ourSeq := binary.BigEndian.Uint32(seqBytes[:])
+		cy = &cycle{
+			srcIP:    srcIP,
+			srcPort:  uint16(t.SrcPort),
+			dstIP:    c.srcIP,
+			dstPort:  c.listenPort,
+			ourSeq:   ourSeq,
+			theirSeq: t.Seq,
+			state:    cycleSynReceived,
+			expires:  time.Now().Add(cycleTimeout),
+		}
+		c.cyclesMu.Lock()
+		c.cycles[key] = cy
+		c.cyclesMu.Unlock()
+		// Respond with [SA].
+		if err := c.sendTCP(cy, tcpFlagsSYNACK, nil); err != nil {
+			flog.Debugf("cycle/server: SA send failed for %s: %v", key, err)
+			c.dropCycle(cy)
+			return
+		}
+		cy.ourSeq++ // SYN consumes one seq slot
+
+	case t.PSH && t.ACK && len(payload) > 0:
+		if !exists {
+			return
+		}
+		cy.state = cycleDataDelivered
+		// Deliver UP using the synthetic per-client UDPAddr (ip-only).
+		c.deliverRead(payload, &net.UDPAddr{IP: srcIP, Port: 0})
+		// Piggyback any queued server outbound for this client IP.
+		out := c.popServerOut(srcIP.String())
+		// Send response: either [PA] with our data + ACK, or bare [A].
+		var flags tcpFlags
+		var body []byte
+		if out != nil {
+			flags = tcpFlagsPSHACK
+			body = out
+		} else {
+			flags = tcpFlagsACK
+		}
+		cy.theirSeq = t.Seq + uint32(len(payload))
+		if err := c.sendTCP(cy, flags, body); err != nil {
+			flog.Debugf("cycle/server: ACK send failed for %s: %v", key, err)
+			c.dropCycle(cy)
+			return
+		}
+		cy.ourSeq += uint32(len(body))
+
+	case t.ACK && !t.SYN && len(payload) == 0:
+		// Bare ACK from client. State transition only.
+		if exists {
+			cy.state = cycleEstablished
+		}
+
+	case t.RST:
+		if exists {
+			c.dropCycle(cy)
+		}
+	}
+}
+
+func (c *CycleConn) deliverRead(data []byte, addr *net.UDPAddr) {
+	buf := append([]byte(nil), data...)
+	rc := c.readCount.Add(1)
+	if rc <= 5 || rc%500 == 0 {
+		flog.Debugf("cycle: deliver read #%d from %s len=%d", rc, addr, len(data))
+	}
+	select {
+	case c.readQueue <- readPacket{data: buf, addr: addr}:
+	case <-c.ctx.Done():
+	}
+}
+
+func (c *CycleConn) dropCycle(cy *cycle) {
+	c.cyclesMu.Lock()
+	delete(c.cycles, cy.key())
+	c.cyclesMu.Unlock()
+}
+
+// cycleSweeper periodically evicts cycles that have aged out, freeing their
+// ports for reuse and bounding memory.
+func (c *CycleConn) cycleSweeper() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case now := <-t.C:
+			c.cyclesMu.Lock()
+			for k, cy := range c.cycles {
+				if now.After(cy.expires) {
+					delete(c.cycles, k)
+				}
+			}
+			c.cyclesMu.Unlock()
+		}
+	}
+}
+
+// =====================================================================
+//  TCP packet crafting
+// =====================================================================
+
+type tcpFlags uint8
+
+const (
+	tcpFlagsSYN    tcpFlags = 1 << iota // SYN
+	tcpFlagsSYNACK                      // SYN+ACK
+	tcpFlagsACK                         // ACK only
+	tcpFlagsPSHACK                      // PSH+ACK (data)
+	tcpFlagsFINACK                      // FIN+ACK
+	tcpFlagsRST                         // RST
+)
+
+func (c *CycleConn) sendTCP(cy *cycle, flags tcpFlags, payload []byte) error {
+	eth := &layers.Ethernet{
+		SrcMAC:       c.srcMAC,
+		DstMAC:       c.dstMAC,
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ip4 := &layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      64,
+		TOS:      0,
+		Protocol: layers.IPProtocolTCP,
+		Flags:    layers.IPv4DontFragment,
+		SrcIP:    cy.srcIP,
+		DstIP:    cy.dstIP,
+	}
+	t := &layers.TCP{
+		SrcPort: layers.TCPPort(cy.srcPort),
+		DstPort: layers.TCPPort(cy.dstPort),
+		Window:  65535,
+		Seq:     cy.ourSeq,
+	}
+	switch flags {
+	case tcpFlagsSYN:
+		t.SYN = true
+		t.Options = synOptions()
+	case tcpFlagsSYNACK:
+		t.SYN = true
+		t.ACK = true
+		t.Ack = cy.theirSeq + 1
+		t.Options = synOptions()
+	case tcpFlagsACK:
+		t.ACK = true
+		t.Ack = cy.theirSeq
+	case tcpFlagsPSHACK:
+		t.PSH = true
+		t.ACK = true
+		t.Ack = cy.theirSeq + 1
+	case tcpFlagsFINACK:
+		t.FIN = true
+		t.ACK = true
+		t.Ack = cy.theirSeq
+	case tcpFlagsRST:
+		t.RST = true
+	}
+	t.SetNetworkLayerForChecksum(ip4)
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, opts, eth, ip4, t, gopacket.Payload(payload)); err != nil {
+		return fmt.Errorf("cycle: serialize: %w", err)
+	}
+	return c.sendHandle.WritePacketData(buf.Bytes())
+}
+
+func synOptions() []layers.TCPOption {
+	return []layers.TCPOption{
+		{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: []byte{0x05, 0xb4}},
+		{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
+		{OptionType: layers.TCPOptionKindNop},
+		{OptionType: layers.TCPOptionKindWindowScale, OptionLength: 3, OptionData: []byte{8}},
+	}
+}

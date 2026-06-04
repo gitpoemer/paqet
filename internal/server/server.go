@@ -42,7 +42,8 @@ func (s *Server) Start() error {
 	}()
 
 	var pConn net.PacketConn
-	if s.cfg.Transport.TCPCarrier {
+	switch s.cfg.Transport.Mode {
+	case "tcp_carrier":
 		tcpAddr := &net.TCPAddr{IP: s.cfg.Listen.Addr.IP, Port: s.cfg.Listen.Addr.Port}
 		tc, err := socket.NewTCPServer(ctx, tcpAddr)
 		if err != nil {
@@ -50,7 +51,16 @@ func (s *Server) Start() error {
 		}
 		pConn = tc
 		flog.Infof("Server started in tcp_carrier mode - listening for TCP on :%d", s.cfg.Listen.Addr.Port)
-	} else {
+	case "handshake_cycle":
+		s.cfg.Network.Port = s.cfg.Listen.Addr.Port
+		cc, err := socket.NewCycleServer(ctx, &s.cfg.Network, uint16(s.cfg.Listen.Addr.Port))
+		if err != nil {
+			return fmt.Errorf("could not create handshake_cycle listener: %w", err)
+		}
+		pConn = cc
+		flog.Infof("Server started in handshake_cycle mode - listening for cycles on :%d", s.cfg.Listen.Addr.Port)
+	default:
+		// "raw" or empty: the original pcap-based transport.
 		pc, err := socket.New(ctx, &s.cfg.Network)
 		if err != nil {
 			return fmt.Errorf("could not create raw packet conn: %w", err)

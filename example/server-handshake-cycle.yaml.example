@@ -1,0 +1,35 @@
+# paqet Server Configuration Example — handshake_cycle mode
+#
+# Companion to client-handshake-cycle.yaml.example. See that file for the
+# wire-pattern description.
+
+role: "server"
+
+log:
+  level: "info"
+
+listen:
+  addr: ":9443"   # CHANGE ME — port clients dial
+
+network:
+  interface: "eth0"
+  ipv4:
+    addr: "1.2.3.4:9443"             # CHANGE ME — public IP : listen port
+    router_mac: "aa:bb:cc:dd:ee:ff"  # CHANGE ME — gateway MAC
+
+transport:
+  protocol: "kcp"
+  mode: "handshake_cycle"
+  conn: 1
+  kcp:
+    mode: "fast3"
+    block: "aes-128-gcm"
+    key: "your-secret-key"          # CHANGE ME — must match client
+    mtu: 1400
+
+# Iptables REQUIRED on server (same as classic pcap mode + protect rotating
+# inbound src ports too):
+#   sudo iptables -t raw    -A PREROUTING -p tcp --dport 9443 -j NOTRACK
+#   sudo iptables -t raw    -A OUTPUT     -p tcp --sport 9443 -j NOTRACK
+#   sudo iptables -t mangle -A OUTPUT     -p tcp --sport 9443 \
+#       --tcp-flags RST RST -j DROP

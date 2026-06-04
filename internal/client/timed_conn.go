@@ -31,7 +31,8 @@ func newTimedConn(ctx context.Context, cfg *conf.Conf) (*timedConn, error) {
 }
 
 func (tc *timedConn) createConn() (tnet.Conn, error) {
-	if tc.cfg.Transport.TCPCarrier {
+	switch tc.cfg.Transport.Mode {
+	case "tcp_carrier":
 		srv := tc.cfg.Server.Addr
 		tcpAddr := &net.TCPAddr{IP: srv.IP, Port: srv.Port, Zone: srv.Zone}
 		pConn, err := socket.NewTCPClient(tc.ctx, tcpAddr)
@@ -42,8 +43,20 @@ func (tc *timedConn) createConn() (tnet.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		// tcp_carrier has no client-side TCP flag negotiation — kernel
-		// owns those. Skip the PTCPF handshake message.
+		return conn, nil
+
+	case "handshake_cycle":
+		netCfg := tc.cfg.Network
+		pConn, err := socket.NewCycleClient(tc.ctx, &netCfg, tc.cfg.Server.Addr)
+		if err != nil {
+			return nil, fmt.Errorf("could not create cycle conn: %w", err)
+		}
+		conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, pConn)
+		if err != nil {
+			return nil, err
+		}
+		// handshake_cycle ignores per-client flag overrides — flag pattern
+		// is built into the cycle state machine.
 		return conn, nil
 	}
 
