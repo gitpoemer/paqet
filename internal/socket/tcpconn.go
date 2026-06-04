@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"paqet/internal/conf"
+	"paqet/internal/flog"
 )
 
 const (
@@ -59,6 +60,10 @@ type TCPConn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	closed atomic.Bool
+
+	// Debug counters (sampled to log via flog.Debugf every N packets).
+	writeCount atomic.Uint64
+	readCount  atomic.Uint64
 }
 
 type tcpStream struct {
@@ -130,6 +135,7 @@ func (tc *TCPConn) acceptLoop() {
 			if tc.closed.Load() {
 				return
 			}
+			flog.Debugf("tcp-carrier: accept error: %v", err)
 			// Transient accept errors: wait briefly and retry.
 			select {
 			case <-tc.ctx.Done():
@@ -149,12 +155,15 @@ func (tc *TCPConn) acceptLoop() {
 		synth := &net.UDPAddr{IP: raddr.IP, Port: raddr.Port, Zone: raddr.Zone}
 		stream := &tcpStream{conn: c, remote: synth, parent: tc}
 		tc.clients.Store(synth.String(), stream)
+		flog.Debugf("tcp-carrier: new TCP stream accepted from %s (synthetic addr %s)", raddr, synth)
 		go tc.readLoop(stream)
 	}
 }
 
 func (tc *TCPConn) readLoop(stream *tcpStream) {
 	defer func() {
+		flog.Debugf("tcp-carrier: readLoop exiting for %s (total read: %d packets)",
+			stream.remote, tc.readCount.Load())
 		stream.conn.Close()
 		if tc.isServer {
 			tc.clients.Delete(stream.remote.String())
@@ -164,6 +173,7 @@ func (tc *TCPConn) readLoop(stream *tcpStream) {
 	for {
 		// Read length prefix.
 		if _, err := io.ReadFull(stream.conn, lenBuf[:]); err != nil {
+			flog.Debugf("tcp-carrier: readLoop read-len error from %s: %v", stream.remote, err)
 			return
 		}
 		n := binary.BigEndian.Uint16(lenBuf[:])
@@ -173,7 +183,12 @@ func (tc *TCPConn) readLoop(stream *tcpStream) {
 		}
 		buf := make([]byte, n)
 		if _, err := io.ReadFull(stream.conn, buf); err != nil {
+			flog.Debugf("tcp-carrier: readLoop read-body(%d) error from %s: %v", n, stream.remote, err)
 			return
+		}
+		c := tc.readCount.Add(1)
+		if c <= 5 || c%500 == 0 {
+			flog.Debugf("tcp-carrier: read #%d from %s, len=%d", c, stream.remote, n)
 		}
 		select {
 		case tc.readQueue <- readPacket{data: buf, addr: stream.remote}:
@@ -252,7 +267,12 @@ func (tc *TCPConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	// writev one frame as a single atomic kernel call.
 	buffers := net.Buffers{lenBuf[:], p}
 	if _, err := buffers.WriteTo(stream.conn); err != nil {
+		flog.Debugf("tcp-carrier: write to %s failed: %v", addr, err)
 		return 0, err
+	}
+	c := tc.writeCount.Add(1)
+	if c <= 5 || c%500 == 0 {
+		flog.Debugf("tcp-carrier: write #%d to %s, len=%d", c, addr, len(p))
 	}
 	return len(p), nil
 }
