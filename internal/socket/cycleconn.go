@@ -646,10 +646,23 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 		// Stray packet for a cycle we no longer track. Ignore.
 		return
 	}
-	cy.theirSeq = t.Seq
 
 	switch {
 	case t.SYN && t.ACK:
+		// Accept SA only if we're actually waiting for one. A SA arriving
+		// after the handshake completed is either a retransmit (harmless to
+		// ignore) or a middlebox injection (dangerous to honor).
+		if cy.state != cycleSynSent {
+			return
+		}
+		// Validate ack: the carrier may inject SAs but can't fake our random
+		// initial seq + 1 without observing the wire — and even if they're
+		// observing, dropping the mismatched ones is cheap.
+		if t.Ack != cy.ourSeq+1 {
+			flog.Debugf("cycle/client: SA ack mismatch (got %d expected %d) for cy %s — dropping (likely injection)", t.Ack, cy.ourSeq+1, cy.key())
+			return
+		}
+		cy.theirSeq = t.Seq
 		cy.ourSeq = t.Ack
 		cy.state = cycleEstablished
 		if cy.pending != nil {
@@ -664,16 +677,26 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 		}
 
 	case t.PSH && t.ACK && len(payload) > 0:
-		// Server's [PA] response. Payload is a length-prefixed bundle
-		// of one-or-more KCP packets (see popServerOutAll). Split and
-		// deliver each to the read queue individually.
+		// Server's [PA] response — accept only on a cycle past handshake.
+		// We do NOT update theirSeq from incoming packets: in hostile-
+		// middlebox environments any state we derive from the wire is
+		// suspect. The payload bytes are still safe because KCP's AEAD
+		// (aes-128-gcm) authenticates the entire KCP frame; injected
+		// garbage just fails decryption and gets dropped silently by KCP.
+		if cy.state != cycleEstablished && cy.state != cycleDataDelivered {
+			return
+		}
 		c.unpackAndDeliver(payload, c.serverAddr)
 
 	case t.ACK && !t.SYN && len(payload) == 0:
 		// Bare ACK from server. Nothing to do.
 
 	case t.RST:
-		c.dropCycle(cy)
+		// The carrier may inject RSTs to forcibly kill flows. Don't
+		// honor them — let the cycle time out via the sweeper instead.
+		// (If the cycle is genuinely dead the sweeper will catch it
+		// within cycleTimeout / loop's expires.)
+		flog.Debugf("cycle/client: RST received for cy %s — ignoring (hostile-middlebox mitigation)", cy.key())
 	}
 }
 
@@ -713,12 +736,19 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 
 	case t.PSH && t.ACK && len(payload) > 0:
 		if !exists {
+			// PA without a known cycle for this peer — either we missed
+			// the SYN (we wouldn't accept it then), or it's an injection.
+			// Either way, ignore.
+			return
+		}
+		// Don't accept PA on a brand-new cycle that hasn't seen an A or
+		// reached established state. Real clients complete the handshake
+		// before sending PA.
+		if cy.state == cycleSynSent {
 			return
 		}
 		cy.state = cycleDataDelivered
-		// Client always sends ONE KCP packet per cycle, no framing on inbound.
 		c.deliverRead(payload, &net.UDPAddr{IP: srcIP, Port: 0})
-		// Drain everything queued for this client IP in one [PA] response.
 		out := c.popServerOutAll(srcIP.String())
 		var flags tcpFlags
 		var body []byte
@@ -731,8 +761,7 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		cy.theirSeq = t.Seq + uint32(len(payload))
 		if err := c.sendTCP(cy, flags, body); err != nil {
 			flog.Debugf("cycle/server: ACK send failed for %s: %v", key, err)
-			c.dropCycle(cy)
-			return
+			return // don't drop on send failure — cycle may recover
 		}
 		cy.ourSeq += uint32(len(body))
 
@@ -742,8 +771,10 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		}
 
 	case t.RST:
+		// Don't honor RST: hostile middleboxes inject these to kill flows.
+		// Cycle will time out naturally if truly dead.
 		if exists {
-			c.dropCycle(cy)
+			flog.Debugf("cycle/server: RST received for cy %s — ignoring (hostile-middlebox mitigation)", key)
 		}
 	}
 }
