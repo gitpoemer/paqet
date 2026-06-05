@@ -47,10 +47,16 @@ type Transport struct {
 	//                    established flow without urgency hint". Less
 	//                    standard but valid TCP.
 	//   "SA"           — TCP Fast Open style: server stuffs queued KCP
-	//                    data into the SYN-ACK response itself. Cycle
-	//                    becomes: client [S] → server [S.]+data →
-	//                    client [PA]+data. Test against carriers that
-	//                    let zero-length SAs pass.
+	//                    data into the SYN-ACK response itself, then
+	//                    falls back to bare [ACK] + payload for any
+	//                    further in-flow data on the same cycle.
+	//   "SAALL"        — like "SA" but EVERY server response (including
+	//                    in-flow follow-ups) uses [SYN-ACK] + payload.
+	//                    Probes whether the carrier per-flow budget
+	//                    re-applies on every SA-flagged packet (each
+	//                    SA looks like a fresh handshake completion).
+	//                    Highly non-standard TCP; only useful when
+	//                    fighting an aggressive content/budget filter.
 	CycleDataFlag string `yaml:"cycle_data_flag"`
 	// LoopRollInterval — for handshake_loop mode, how long a single flow
 	// stays active before being closed and rolled to a new source port.
@@ -116,7 +122,7 @@ func (t *Transport) validate() []error {
 		errors = append(errors, fmt.Errorf("transport mode must be one of: %v", validModes))
 	}
 
-	validDataFlags := []string{"PA", "A", "SA"}
+	validDataFlags := []string{"PA", "A", "SA", "SAALL"}
 	if !slices.Contains(validDataFlags, t.CycleDataFlag) {
 		errors = append(errors, fmt.Errorf("transport cycle_data_flag must be one of: %v", validDataFlags))
 	}

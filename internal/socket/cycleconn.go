@@ -679,44 +679,50 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 
 	switch {
 	case t.SYN && t.ACK:
-		// Accept SA only if we're actually waiting for one. A SA arriving
-		// after the handshake completed is either a retransmit (harmless to
-		// ignore) or a middlebox injection (dangerous to honor).
-		if cy.state != cycleSynSent {
-			return
-		}
-		// Validate ack: the carrier may inject SAs but can't fake our random
-		// initial seq + 1 without observing the wire — and even if they're
-		// observing, dropping the mismatched ones is cheap.
-		if t.Ack != cy.ourSeq+1 {
-			flog.Debugf("cycle/client: SA ack mismatch (got %d expected %d) for cy %s — dropping (likely injection)", t.Ack, cy.ourSeq+1, cy.key())
-			return
-		}
-		// In "SA" data-flag mode the server piggybacks KCP data on the
-		// SYN-ACK itself. Extract it before completing the handshake.
-		if len(payload) > 0 {
-			c.unpackAndDeliver(payload, c.serverAddr)
-		}
-		cy.theirSeq = t.Seq + uint32(len(payload))
-		cy.ourSeq = t.Ack
-		cy.state = cycleEstablished
-		// Drain queued KCP packets. cy.pending may hold the initial
-		// payload from cycleStart plus any extras enqueued via
-		// loopWriteTo while the handshake was in flight.
-		cy.pendingMu.Lock()
-		pending := cy.pending
-		cy.pending = nil
-		cy.pendingMu.Unlock()
-		for _, pkt := range pending {
-			if err := c.sendTCP(cy, tcpFlagsPSHACK, pkt); err != nil {
-				flog.Debugf("cycle/client: PA send failed for localPort=%d: %v", cy.localPort, err)
-				c.dropCycle(cy)
+		// SA arrival. There are two interpretations:
+		//
+		// 1. Handshake completion — the normal case. cy was in cycleSynSent
+		//    state. We validate the ack and transition the cycle to
+		//    established. Any payload is the initial server-data piggyback.
+		//
+		// 2. In-flow SA (SAALL mode) — the server is using [SA]+payload as
+		//    the carrier for every response. cy is already established; we
+		//    just want to extract the payload and deliver to KCP. Don't
+		//    re-do the handshake state transition.
+		if cy.state == cycleSynSent {
+			// Validate ack: the carrier may inject SAs but can't fake our
+			// random initial seq + 1 without observing the wire.
+			if t.Ack != cy.ourSeq+1 {
+				flog.Debugf("cycle/client: SA ack mismatch (got %d expected %d) for cy %s — dropping (likely injection)", t.Ack, cy.ourSeq+1, cy.key())
 				return
 			}
-			cy.ourSeq += uint32(len(pkt))
-		}
-		if len(pending) > 0 {
-			cy.state = cycleDataDelivered
+			if len(payload) > 0 {
+				c.unpackAndDeliver(payload, c.serverAddr)
+			}
+			cy.theirSeq = t.Seq + uint32(len(payload))
+			cy.ourSeq = t.Ack
+			cy.state = cycleEstablished
+			// Drain queued KCP packets.
+			cy.pendingMu.Lock()
+			pending := cy.pending
+			cy.pending = nil
+			cy.pendingMu.Unlock()
+			for _, pkt := range pending {
+				if err := c.sendTCP(cy, tcpFlagsPSHACK, pkt); err != nil {
+					flog.Debugf("cycle/client: PA send failed for localPort=%d: %v", cy.localPort, err)
+					c.dropCycle(cy)
+					return
+				}
+				cy.ourSeq += uint32(len(pkt))
+			}
+			if len(pending) > 0 {
+				cy.state = cycleDataDelivered
+			}
+		} else {
+			// Post-handshake SA (SAALL mode). Treat as data delivery.
+			if len(payload) > 0 {
+				c.unpackAndDeliver(payload, c.serverAddr)
+			}
 		}
 
 	case t.ACK && !t.SYN && len(payload) > 0:
@@ -770,12 +776,12 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		c.cyclesMu.Lock()
 		c.cycles[key] = cy
 		c.cyclesMu.Unlock()
-		// In "SA" data-flag mode the server piggybacks queued KCP data
-		// into the SYN-ACK itself (TCP Fast Open style). This is
-		// because some hostile carriers drop server→client packets
+		// In "SA"/"SAALL" data-flag mode the server piggybacks queued
+		// KCP data into the SYN-ACK itself (TCP Fast Open style). This
+		// is because some hostile carriers drop server→client packets
 		// with payload UNLESS they're on this specific flag combo.
 		var saBody []byte
-		if c.serverDataFlag == "SA" {
+		if c.serverDataFlag == "SA" || c.serverDataFlag == "SAALL" {
 			saBody = c.popServerOutAll(srcIP.String())
 		}
 		if err := c.sendTCP(cy, tcpFlagsSYNACK, saBody); err != nil {
@@ -801,20 +807,22 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		cy.state = cycleDataDelivered
 		c.deliverRead(payload, &net.UDPAddr{IP: srcIP, Port: 0})
 		// ALWAYS try to drain the server's queue on every response — not
-		// just at handshake. The handshake SA-piggyback (when serverDataFlag=
-		// "SA") drains whatever's queued at that moment; but the queue keeps
-		// accumulating as KCP/smux generates response packets, and those
-		// also need a delivery channel. For SA mode, ongoing responses fall
-		// back to bare ACK with payload (which we know passes the same
-		// carrier filter that allows the SA-with-payload).
+		// just at handshake. The handshake SA-piggyback drains whatever's
+		// queued at that moment; the queue keeps accumulating as KCP/smux
+		// generates response packets, and those also need a delivery
+		// channel.
 		out := c.popServerOutAll(srcIP.String())
 		var flags tcpFlags
 		var body []byte
 		if out != nil {
 			switch c.serverDataFlag {
+			case "SAALL":
+				// Every server response is a fresh [SA]+payload. Probes
+				// whether the carrier re-applies its per-flow handshake
+				// budget on each SA-flagged packet.
+				flags = tcpFlagsSYNACK
 			case "A", "SA":
-				// SA mode uses the SA only at flow start; ongoing data
-				// rides bare-ACK-with-payload (same carrier-bypass).
+				// Ongoing data rides bare-ACK-with-payload.
 				flags = tcpFlagsACK
 			default: // "PA"
 				flags = tcpFlagsPSHACK
