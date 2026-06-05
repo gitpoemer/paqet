@@ -51,14 +51,15 @@ func (s *Server) Start() error {
 		}
 		pConn = tc
 		flog.Infof("Server started in tcp_carrier mode - listening for TCP on :%d", s.cfg.Listen.Addr.Port)
-	case "handshake_cycle":
+	case "handshake_cycle", "handshake_loop":
 		s.cfg.Network.Port = s.cfg.Listen.Addr.Port
-		cc, err := socket.NewCycleServer(ctx, &s.cfg.Network, uint16(s.cfg.Listen.Addr.Port))
+		isLoop := s.cfg.Transport.Mode == "handshake_loop"
+		cc, err := socket.NewCycleServer(ctx, &s.cfg.Network, uint16(s.cfg.Listen.Addr.Port), isLoop)
 		if err != nil {
-			return fmt.Errorf("could not create handshake_cycle listener: %w", err)
+			return fmt.Errorf("could not create %s listener: %w", s.cfg.Transport.Mode, err)
 		}
 		pConn = cc
-		flog.Infof("Server started in handshake_cycle mode - listening for cycles on :%d", s.cfg.Listen.Addr.Port)
+		flog.Infof("Server started in %s mode - listening on :%d", s.cfg.Transport.Mode, s.cfg.Listen.Addr.Port)
 	default:
 		// "raw" or empty: the original pcap-based transport.
 		pc, err := socket.New(ctx, &s.cfg.Network)

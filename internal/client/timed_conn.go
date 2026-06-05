@@ -45,18 +45,17 @@ func (tc *timedConn) createConn() (tnet.Conn, error) {
 		}
 		return conn, nil
 
-	case "handshake_cycle":
+	case "handshake_cycle", "handshake_loop":
 		netCfg := tc.cfg.Network
-		pConn, err := socket.NewCycleClient(tc.ctx, &netCfg, tc.cfg.Server.Addr)
+		isLoop := tc.cfg.Transport.Mode == "handshake_loop"
+		pConn, err := socket.NewCycleClient(tc.ctx, &netCfg, tc.cfg.Server.Addr, isLoop)
 		if err != nil {
-			return nil, fmt.Errorf("could not create cycle conn: %w", err)
+			return nil, fmt.Errorf("could not create %s conn: %w", tc.cfg.Transport.Mode, err)
 		}
 		conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, pConn)
 		if err != nil {
 			return nil, err
 		}
-		// handshake_cycle ignores per-client flag overrides — flag pattern
-		// is built into the cycle state machine.
 		return conn, nil
 	}
 

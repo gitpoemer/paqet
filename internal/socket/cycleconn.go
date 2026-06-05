@@ -63,6 +63,12 @@ const (
 	cycleQueueCap         = 2048
 	cycleTimeout          = 5 * time.Second
 	cycleMaxPacket        = 65535
+
+	// Mode B (handshake_loop) — how long a single long-lived flow stays
+	// active before rolling to a fresh source port (and new handshake).
+	// The roll exists to defeat middlebox "long-lived non-standard
+	// connection" detectors that engage on flows >N seconds old.
+	loopRollInterval = 8 * time.Second
 )
 
 // cycleState marks how far the per-cycle TCP-mimic handshake has progressed.
@@ -111,10 +117,26 @@ func cycleKey(ip net.IP, port uint16) string {
 	return fmt.Sprintf("%s:%d", ip.String(), port)
 }
 
-// CycleConn implements net.PacketConn for the handshake_cycle transport.
+// CycleConn implements net.PacketConn for both the handshake_cycle and
+// handshake_loop transport modes. The two modes share the same wire-level
+// state machine and packet crafting; they differ only in cycle lifecycle:
+//
+//   handshake_cycle — one cycle per KCP packet, ephemeral. Each client
+//                     WriteTo allocates a new source port + new cycle.
+//                     Designed to look like many short legit-looking TCP
+//                     connections (per-packet rotation).
+//
+//   handshake_loop  — one persistent cycle per WriteTo flow, periodically
+//                     rolled to a new source port every loopRollInterval
+//                     (8s). The roll is a graceful close (FIN/ACK) + new
+//                     SYN sequence so the carrier sees the connection
+//                     close cleanly and a fresh one open. Designed for
+//                     environments where per-packet rotation is too
+//                     suspicious (SYN-flood-detector territory).
 type CycleConn struct {
 	cfg      *conf.Network
 	isServer bool
+	isLoop   bool // false = cycle mode, true = loop mode
 
 	sendHandle *pcap.Handle
 	recvHandle *pcap.Handle
@@ -132,6 +154,10 @@ type CycleConn struct {
 	// Cycle state.
 	cyclesMu sync.Mutex
 	cycles   map[string]*cycle
+
+	// Client-only loop mode: the currently active cycle, swapped on roll.
+	activeLoopMu sync.Mutex
+	activeLoop   *cycle
 
 	// Client-only: port pool cursor (atomic for cheap allocation).
 	portCursor atomic.Uint32
@@ -157,9 +183,11 @@ type CycleConn struct {
 	closed atomic.Bool
 }
 
-// NewCycleServer creates a handshake_cycle PacketConn in server mode.
-func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16) (*CycleConn, error) {
-	cc, err := newCycleConn(ctx, cfg, true, listenPort, nil)
+// NewCycleServer creates a PacketConn in server mode for cycle/loop modes.
+// The server's wire behavior is identical between the two — the mode flag
+// only changes client-side cycle lifecycle.
+func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, isLoop bool) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, true, isLoop, listenPort, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -168,23 +196,24 @@ func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16) (
 	return cc, nil
 }
 
-// NewCycleClient creates a handshake_cycle PacketConn in client mode.
-func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr) (*CycleConn, error) {
-	cc, err := newCycleConn(ctx, cfg, false, 0, serverAddr)
+// NewCycleClient creates a PacketConn in client mode for cycle/loop modes.
+func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr, isLoop bool) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, false, isLoop, 0, serverAddr)
 	if err != nil {
 		return nil, err
 	}
-	// Seed the port cursor to a random offset so two cycle clients on the
-	// same host don't always pick the same first port.
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	cc.portCursor.Store(binary.BigEndian.Uint32(b[:]))
 	go cc.recvLoop()
 	go cc.cycleSweeper()
+	if isLoop {
+		go cc.loopRoller()
+	}
 	return cc, nil
 }
 
-func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, listenPort uint16, serverAddr *net.UDPAddr) (*CycleConn, error) {
+func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop bool, listenPort uint16, serverAddr *net.UDPAddr) (*CycleConn, error) {
 	sendH, err := openCyclePcap(cfg, pcap.DirectionOut)
 	if err != nil {
 		return nil, fmt.Errorf("cycle: open send pcap: %w", err)
@@ -213,6 +242,7 @@ func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, listenP
 	cc := &CycleConn{
 		cfg:        cfg,
 		isServer:   isServer,
+		isLoop:     isLoop,
 		sendHandle: sendH,
 		recvHandle: recvH,
 		srcMAC:     cfg.Interface.HardwareAddr,
@@ -369,6 +399,14 @@ var _ net.PacketConn = (*CycleConn)(nil)
 // =====================================================================
 
 func (c *CycleConn) clientWriteTo(p []byte, addr net.Addr) (int, error) {
+	if c.isLoop {
+		return c.loopWriteTo(p)
+	}
+	return c.cycleWriteTo(p)
+}
+
+// cycleWriteTo: handshake_cycle behavior — fresh cycle per KCP packet.
+func (c *CycleConn) cycleWriteTo(p []byte) (int, error) {
 	localPort := c.allocPort()
 	remoteIP := c.serverAddr.IP
 	remotePort := uint16(c.serverAddr.Port)
@@ -382,7 +420,7 @@ func (c *CycleConn) clientWriteTo(p []byte, addr net.Addr) (int, error) {
 		localPort:  localPort,
 		remoteIP:   remoteIP,
 		remotePort: remotePort,
-		mapKey:     cycleKey(c.srcIP, localPort), // client keys by our local port
+		mapKey:     cycleKey(c.srcIP, localPort),
 		ourSeq:     ourSeq,
 		state:      cycleSynSent,
 		pending:    append([]byte(nil), p...),
@@ -402,6 +440,96 @@ func (c *CycleConn) clientWriteTo(p []byte, addr net.Addr) (int, error) {
 		flog.Debugf("cycle/client: cycle started localPort=%d wc=%d kcpLen=%d", localPort, wc, len(p))
 	}
 	return len(p), nil
+}
+
+// loopWriteTo: handshake_loop behavior — long-lived cycle, rolled by the
+// loopRoller goroutine every loopRollInterval. WriteTo either sends on
+// the active established cycle, or starts a fresh one if there isn't one.
+func (c *CycleConn) loopWriteTo(p []byte) (int, error) {
+	c.activeLoopMu.Lock()
+	cy := c.activeLoop
+	c.activeLoopMu.Unlock()
+
+	// No active cycle yet, or current one is closed. Start a fresh
+	// handshake and stash the payload to be sent when [SA] arrives.
+	if cy == nil || cy.state == cycleClosed {
+		return c.loopStartCycle(p)
+	}
+
+	// Active cycle is established — send the payload immediately as [PA].
+	cy.theirSeq = cy.theirSeq // no-op, just for clarity
+	if err := c.sendTCP(cy, tcpFlagsPSHACK, p); err != nil {
+		flog.Debugf("loop/client: PA send failed: %v", err)
+		return 0, err
+	}
+	cy.ourSeq += uint32(len(p))
+	wc := c.writeCount.Add(1)
+	if wc <= 5 || wc%500 == 0 {
+		flog.Debugf("loop/client: PA on existing cycle localPort=%d wc=%d kcpLen=%d", cy.localPort, wc, len(p))
+	}
+	return len(p), nil
+}
+
+func (c *CycleConn) loopStartCycle(initialPayload []byte) (int, error) {
+	localPort := c.allocPort()
+	var seqBytes [4]byte
+	_, _ = rand.Read(seqBytes[:])
+	ourSeq := binary.BigEndian.Uint32(seqBytes[:])
+
+	cy := &cycle{
+		localIP:    c.srcIP,
+		localPort:  localPort,
+		remoteIP:   c.serverAddr.IP,
+		remotePort: uint16(c.serverAddr.Port),
+		mapKey:     cycleKey(c.srcIP, localPort),
+		ourSeq:     ourSeq,
+		state:      cycleSynSent,
+		pending:    append([]byte(nil), initialPayload...),
+		expires:    time.Now().Add(time.Hour), // long-lived; loopRoller manages rolls
+	}
+	c.cyclesMu.Lock()
+	c.cycles[cy.key()] = cy
+	c.cyclesMu.Unlock()
+	c.activeLoopMu.Lock()
+	c.activeLoop = cy
+	c.activeLoopMu.Unlock()
+	if err := c.sendTCP(cy, tcpFlagsSYN, nil); err != nil {
+		c.dropCycle(cy)
+		c.activeLoopMu.Lock()
+		c.activeLoop = nil
+		c.activeLoopMu.Unlock()
+		return 0, err
+	}
+	wc := c.writeCount.Add(1)
+	if wc <= 5 || wc%500 == 0 {
+		flog.Debugf("loop/client: new cycle localPort=%d wc=%d kcpLen=%d", localPort, wc, len(initialPayload))
+	}
+	return len(initialPayload), nil
+}
+
+// loopRoller closes the current active cycle and forces a new handshake
+// every loopRollInterval, so the carrier sees a stream of medium-lived
+// connections instead of one long-lived flow.
+func (c *CycleConn) loopRoller() {
+	t := time.NewTicker(loopRollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			c.activeLoopMu.Lock()
+			cy := c.activeLoop
+			c.activeLoop = nil
+			c.activeLoopMu.Unlock()
+			if cy != nil && cy.state != cycleClosed {
+				// Graceful close: FIN-ACK so the carrier sees a normal teardown.
+				_ = c.sendTCP(cy, tcpFlagsFINACK, nil)
+				cy.state = cycleClosed
+				flog.Debugf("loop/client: rolled cycle localPort=%d", cy.localPort)
+			}
+		}
+	}
 }
 
 // =====================================================================
