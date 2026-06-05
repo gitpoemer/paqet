@@ -774,18 +774,21 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		}
 		cy.state = cycleDataDelivered
 		c.deliverRead(payload, &net.UDPAddr{IP: srcIP, Port: 0})
-		// Pick the flag for the server's data response per config. In "SA"
-		// mode the data has already been delivered via the SYN-ACK back-
-		// channel, so we send only a bare ACK here.
-		var out []byte
-		if c.serverDataFlag != "SA" {
-			out = c.popServerOutAll(srcIP.String())
-		}
+		// ALWAYS try to drain the server's queue on every response — not
+		// just at handshake. The handshake SA-piggyback (when serverDataFlag=
+		// "SA") drains whatever's queued at that moment; but the queue keeps
+		// accumulating as KCP/smux generates response packets, and those
+		// also need a delivery channel. For SA mode, ongoing responses fall
+		// back to bare ACK with payload (which we know passes the same
+		// carrier filter that allows the SA-with-payload).
+		out := c.popServerOutAll(srcIP.String())
 		var flags tcpFlags
 		var body []byte
 		if out != nil {
 			switch c.serverDataFlag {
-			case "A":
+			case "A", "SA":
+				// SA mode uses the SA only at flow start; ongoing data
+				// rides bare-ACK-with-payload (same carrier-bypass).
 				flags = tcpFlagsACK
 			default: // "PA"
 				flags = tcpFlagsPSHACK
