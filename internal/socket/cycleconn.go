@@ -880,13 +880,28 @@ func (c *CycleConn) unpackAndDeliver(payload []byte, addr *net.UDPAddr) {
 }
 
 func (c *CycleConn) dropCycle(cy *cycle) {
+	// If the cycle ever got past the handshake, send a [FIN-ACK] to
+	// signal a clean close. This nudges the carrier's NAT conntrack
+	// out of ESTABLISHED into LAST_ACK / TIME_WAIT, which frees the
+	// 5-tuple's slot in the carrier's per-source-IP conntrack budget
+	// much sooner than letting it linger to idle timeout (typically
+	// 60-120s for established TCP without FIN).
+	//
+	// Skip FIN if we never established (still in SYN_SENT) or if
+	// state is already cycleClosed (avoid double-FIN under races).
+	if cy.state == cycleEstablished || cy.state == cycleDataDelivered || cy.state == cycleSynReceived {
+		_ = c.sendTCP(cy, tcpFlagsFINACK, nil)
+	}
+	cy.state = cycleClosed
 	c.cyclesMu.Lock()
 	delete(c.cycles, cy.key())
 	c.cyclesMu.Unlock()
 }
 
-// cycleSweeper periodically evicts cycles that have aged out, freeing their
-// ports for reuse and bounding memory.
+// cycleSweeper periodically evicts cycles that have aged out, freeing
+// their ports for reuse and bounding memory. Expired cycles are closed
+// via dropCycle, which sends a [FIN-ACK] so carrier conntrack frees the
+// 5-tuple's slot quickly (vs idling for the ESTABLISHED-timeout period).
 func (c *CycleConn) cycleSweeper() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -895,13 +910,18 @@ func (c *CycleConn) cycleSweeper() {
 		case <-c.ctx.Done():
 			return
 		case now := <-t.C:
+			var expired []*cycle
 			c.cyclesMu.Lock()
-			for k, cy := range c.cycles {
+			for _, cy := range c.cycles {
 				if now.After(cy.expires) {
-					delete(c.cycles, k)
+					expired = append(expired, cy)
 				}
 			}
 			c.cyclesMu.Unlock()
+			// dropCycle takes the lock itself, so call it outside.
+			for _, cy := range expired {
+				c.dropCycle(cy)
+			}
 		}
 	}
 }
