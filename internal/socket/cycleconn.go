@@ -100,10 +100,13 @@ type cycle struct {
 
 	state cycleState
 
-	// Payload queued for sending. On client side this is the KCP packet
-	// staged for the [PA] step. On server side this is the KCP packet that
-	// the server's KCP layer wants to send back on this cycle's [PA] ACK.
-	pending []byte
+	// pending holds KCP packets that arrived from the KCP layer before the
+	// TCP-mimic handshake completed. They get drained in order onto the
+	// cycle when state transitions to cycleEstablished. Mostly used in
+	// loop mode where multiple KCP packets can queue up during the
+	// handshake window.
+	pendingMu sync.Mutex
+	pending   [][]byte
 
 	expires time.Time
 }
@@ -435,7 +438,7 @@ func (c *CycleConn) cycleWriteTo(p []byte) (int, error) {
 		mapKey:     cycleKey(c.srcIP, localPort),
 		ourSeq:     ourSeq,
 		state:      cycleSynSent,
-		pending:    append([]byte(nil), p...),
+		pending:    [][]byte{append([]byte(nil), p...)},
 		expires:    time.Now().Add(cycleTimeout),
 	}
 
@@ -457,6 +460,13 @@ func (c *CycleConn) cycleWriteTo(p []byte) (int, error) {
 // loopWriteTo: handshake_loop behavior — long-lived cycle, rolled by the
 // loopRoller goroutine every loopRollInterval. WriteTo either sends on
 // the active established cycle, or starts a fresh one if there isn't one.
+//
+// If the active cycle exists but is still in handshake (cycleSynSent),
+// we MUST NOT emit a [PA] yet — it would arrive at the server before the
+// server has sent [SA], with the SYN's seq value (no real seq advance
+// has happened), and confuse the server's state machine. Instead we
+// queue the packet onto cy.pending and let the SA-arrival handler drain
+// the queue in order.
 func (c *CycleConn) loopWriteTo(p []byte) (int, error) {
 	c.activeLoopMu.Lock()
 	cy := c.activeLoop
@@ -468,8 +478,16 @@ func (c *CycleConn) loopWriteTo(p []byte) (int, error) {
 		return c.loopStartCycle(p)
 	}
 
+	if cy.state == cycleSynSent {
+		// Handshake in flight — queue the packet rather than sending
+		// it with a stale seq. The SA handler will drain the queue.
+		cy.pendingMu.Lock()
+		cy.pending = append(cy.pending, append([]byte(nil), p...))
+		cy.pendingMu.Unlock()
+		return len(p), nil
+	}
+
 	// Active cycle is established — send the payload immediately as [PA].
-	cy.theirSeq = cy.theirSeq // no-op, just for clarity
 	if err := c.sendTCP(cy, tcpFlagsPSHACK, p); err != nil {
 		flog.Debugf("loop/client: PA send failed: %v", err)
 		return 0, err
@@ -496,7 +514,7 @@ func (c *CycleConn) loopStartCycle(initialPayload []byte) (int, error) {
 		mapKey:     cycleKey(c.srcIP, localPort),
 		ourSeq:     ourSeq,
 		state:      cycleSynSent,
-		pending:    append([]byte(nil), initialPayload...),
+		pending:    [][]byte{append([]byte(nil), initialPayload...)},
 		expires:    time.Now().Add(time.Hour), // long-lived; loopRoller manages rolls
 	}
 	c.cyclesMu.Lock()
@@ -682,14 +700,22 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 		cy.theirSeq = t.Seq + uint32(len(payload))
 		cy.ourSeq = t.Ack
 		cy.state = cycleEstablished
-		if cy.pending != nil {
-			if err := c.sendTCP(cy, tcpFlagsPSHACK, cy.pending); err != nil {
+		// Drain queued KCP packets. cy.pending may hold the initial
+		// payload from cycleStart plus any extras enqueued via
+		// loopWriteTo while the handshake was in flight.
+		cy.pendingMu.Lock()
+		pending := cy.pending
+		cy.pending = nil
+		cy.pendingMu.Unlock()
+		for _, pkt := range pending {
+			if err := c.sendTCP(cy, tcpFlagsPSHACK, pkt); err != nil {
 				flog.Debugf("cycle/client: PA send failed for localPort=%d: %v", cy.localPort, err)
 				c.dropCycle(cy)
 				return
 			}
-			cy.ourSeq += uint32(len(cy.pending))
-			cy.pending = nil
+			cy.ourSeq += uint32(len(pkt))
+		}
+		if len(pending) > 0 {
 			cy.state = cycleDataDelivered
 		}
 
