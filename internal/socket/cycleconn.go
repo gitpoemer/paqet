@@ -79,13 +79,18 @@ const (
 
 // cycle holds per-handshake state on either side.
 //
-// On the CLIENT side, keyed by local src_port we picked.
-// On the SERVER side, keyed by "<client_ip>:<client_src_port>".
+// All four addr fields are "local perspective" — local = us, remote = peer.
+// The cycle's lookup key in the map is derived role-dependently:
+//   client side: localPort (rotating per-packet, unique)
+//   server side: "<remoteIP>:<remotePort>" (unique inbound 5-tuple from the
+//                  client; our local side is the same listen port for all)
 type cycle struct {
-	srcIP   net.IP // local IP for client; remote (client) IP for server
-	srcPort uint16
-	dstIP   net.IP
-	dstPort uint16
+	localIP    net.IP
+	localPort  uint16
+	remoteIP   net.IP
+	remotePort uint16
+
+	mapKey string // pre-computed key for cycles map lookup
 
 	ourSeq   uint32 // next seq we'll use when sending
 	theirSeq uint32 // last seq we saw from peer
@@ -100,9 +105,7 @@ type cycle struct {
 	expires time.Time
 }
 
-func (c *cycle) key() string {
-	return cycleKey(c.srcIP, c.srcPort)
-}
+func (c *cycle) key() string { return c.mapKey }
 
 func cycleKey(ip net.IP, port uint16) string {
 	return fmt.Sprintf("%s:%d", ip.String(), port)
@@ -282,8 +285,9 @@ func (c *CycleConn) allocPort() uint16 {
 	for range int(cyclePoolSize) {
 		idx := c.portCursor.Add(1)
 		port := cyclePoolBase + uint16(idx%uint32(cyclePoolSize))
+		key := cycleKey(c.srcIP, port)
 		c.cyclesMu.Lock()
-		_, busy := c.cycles[cycleKey(c.srcIP, port)]
+		_, busy := c.cycles[key]
 		c.cyclesMu.Unlock()
 		if !busy {
 			return port
@@ -365,23 +369,24 @@ var _ net.PacketConn = (*CycleConn)(nil)
 // =====================================================================
 
 func (c *CycleConn) clientWriteTo(p []byte, addr net.Addr) (int, error) {
-	srcPort := c.allocPort()
-	dstIP := c.serverAddr.IP
-	dstPort := uint16(c.serverAddr.Port)
+	localPort := c.allocPort()
+	remoteIP := c.serverAddr.IP
+	remotePort := uint16(c.serverAddr.Port)
 
 	var seqBytes [4]byte
 	_, _ = rand.Read(seqBytes[:])
 	ourSeq := binary.BigEndian.Uint32(seqBytes[:])
 
 	cy := &cycle{
-		srcIP:   c.srcIP,
-		srcPort: srcPort,
-		dstIP:   dstIP,
-		dstPort: dstPort,
-		ourSeq:  ourSeq,
-		state:   cycleSynSent,
-		pending: append([]byte(nil), p...),
-		expires: time.Now().Add(cycleTimeout),
+		localIP:    c.srcIP,
+		localPort:  localPort,
+		remoteIP:   remoteIP,
+		remotePort: remotePort,
+		mapKey:     cycleKey(c.srcIP, localPort), // client keys by our local port
+		ourSeq:     ourSeq,
+		state:      cycleSynSent,
+		pending:    append([]byte(nil), p...),
+		expires:    time.Now().Add(cycleTimeout),
 	}
 
 	c.cyclesMu.Lock()
@@ -394,7 +399,7 @@ func (c *CycleConn) clientWriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 	wc := c.writeCount.Add(1)
 	if wc <= 5 || wc%500 == 0 {
-		flog.Debugf("cycle/client: cycle started srcPort=%d wc=%d kcpLen=%d", srcPort, wc, len(p))
+		flog.Debugf("cycle/client: cycle started localPort=%d wc=%d kcpLen=%d", localPort, wc, len(p))
 	}
 	return len(p), nil
 }
@@ -419,15 +424,36 @@ func (c *CycleConn) serverWriteTo(p []byte, addr net.Addr) (int, error) {
 	return len(p), nil
 }
 
-func (c *CycleConn) popServerOut(ipKey string) []byte {
+// popServerOutAll drains every queued KCP packet for the given client IP and
+// returns them concatenated as a length-prefixed multi-packet stream:
+//   [2-byte BE len][pkt1][2-byte BE len][pkt2]...
+// The receiving cycleconn on the peer parses this same framing and delivers
+// each packet to the KCP layer individually.
+//
+// Returns nil if the queue is empty. Honors mtu-derived cap on payload size
+// so a single [PA] won't exceed what TCP/MTU allows.
+func (c *CycleConn) popServerOutAll(ipKey string) []byte {
+	const maxBundle = 1300 // leave headroom under typical 1500 MTU for IP+TCP+options
 	c.serverOutMu.Lock()
 	defer c.serverOutMu.Unlock()
 	q := c.serverOut[ipKey]
 	if len(q) == 0 {
 		return nil
 	}
-	out := q[0]
-	c.serverOut[ipKey] = q[1:]
+	var out []byte
+	consumed := 0
+	for _, pkt := range q {
+		need := 2 + len(pkt)
+		if len(out)+need > maxBundle && len(out) > 0 {
+			break
+		}
+		var lb [2]byte
+		binary.BigEndian.PutUint16(lb[:], uint16(len(pkt)))
+		out = append(out, lb[:]...)
+		out = append(out, pkt...)
+		consumed++
+	}
+	c.serverOut[ipKey] = q[consumed:]
 	return out
 }
 
@@ -483,27 +509,24 @@ func (c *CycleConn) handleIncoming(srcIP, dstIP net.IP, t *layers.TCP, app gopac
 }
 
 func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []byte) {
-	// On client, key by our local port (the dst port of incoming packet).
+	// On client, key by our local port (= dst port of the incoming packet).
 	key := cycleKey(c.srcIP, uint16(t.DstPort))
 	c.cyclesMu.Lock()
 	cy, exists := c.cycles[key]
 	c.cyclesMu.Unlock()
 	if !exists {
-		// Stray packet for a cycle we no longer track (already swept or
-		// brand new SYN from an attacker). Ignore.
+		// Stray packet for a cycle we no longer track. Ignore.
 		return
 	}
 	cy.theirSeq = t.Seq
 
 	switch {
 	case t.SYN && t.ACK:
-		// [SA] — handshake completing. Respond with [PA] carrying the
-		// payload we stashed when WriteTo was called.
-		cy.ourSeq = t.Ack // server expects this as our next seq
+		cy.ourSeq = t.Ack
 		cy.state = cycleEstablished
 		if cy.pending != nil {
 			if err := c.sendTCP(cy, tcpFlagsPSHACK, cy.pending); err != nil {
-				flog.Debugf("cycle/client: PA send failed for srcPort=%d: %v", cy.srcPort, err)
+				flog.Debugf("cycle/client: PA send failed for localPort=%d: %v", cy.localPort, err)
 				c.dropCycle(cy)
 				return
 			}
@@ -513,11 +536,10 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 		}
 
 	case t.PSH && t.ACK && len(payload) > 0:
-		// [PA] from server with data — server's response. Deliver UP to
-		// KCP via the read queue. KCP doesn't care about TCP semantics;
-		// it just wants the packet body.
-		c.deliverRead(payload, c.serverAddr)
-		// We won't send any further packets on this cycle.
+		// Server's [PA] response. Payload is a length-prefixed bundle
+		// of one-or-more KCP packets (see popServerOutAll). Split and
+		// deliver each to the read queue individually.
+		c.unpackAndDeliver(payload, c.serverAddr)
 
 	case t.ACK && !t.SYN && len(payload) == 0:
 		// Bare ACK from server. Nothing to do.
@@ -528,6 +550,7 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 }
 
 func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []byte) {
+	// On server, key by the client's (remote) address.
 	key := cycleKey(srcIP, uint16(t.SrcPort))
 	c.cyclesMu.Lock()
 	cy, exists := c.cycles[key]
@@ -540,19 +563,19 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		_, _ = rand.Read(seqBytes[:])
 		ourSeq := binary.BigEndian.Uint32(seqBytes[:])
 		cy = &cycle{
-			srcIP:    srcIP,
-			srcPort:  uint16(t.SrcPort),
-			dstIP:    c.srcIP,
-			dstPort:  c.listenPort,
-			ourSeq:   ourSeq,
-			theirSeq: t.Seq,
-			state:    cycleSynReceived,
-			expires:  time.Now().Add(cycleTimeout),
+			localIP:    c.srcIP,             // our IP (server's)
+			localPort:  c.listenPort,         // our listen port
+			remoteIP:   srcIP,                // client's IP
+			remotePort: uint16(t.SrcPort),    // client's source port
+			mapKey:     key,
+			ourSeq:     ourSeq,
+			theirSeq:   t.Seq,
+			state:      cycleSynReceived,
+			expires:    time.Now().Add(cycleTimeout),
 		}
 		c.cyclesMu.Lock()
 		c.cycles[key] = cy
 		c.cyclesMu.Unlock()
-		// Respond with [SA].
 		if err := c.sendTCP(cy, tcpFlagsSYNACK, nil); err != nil {
 			flog.Debugf("cycle/server: SA send failed for %s: %v", key, err)
 			c.dropCycle(cy)
@@ -565,11 +588,10 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 			return
 		}
 		cy.state = cycleDataDelivered
-		// Deliver UP using the synthetic per-client UDPAddr (ip-only).
+		// Client always sends ONE KCP packet per cycle, no framing on inbound.
 		c.deliverRead(payload, &net.UDPAddr{IP: srcIP, Port: 0})
-		// Piggyback any queued server outbound for this client IP.
-		out := c.popServerOut(srcIP.String())
-		// Send response: either [PA] with our data + ACK, or bare [A].
+		// Drain everything queued for this client IP in one [PA] response.
+		out := c.popServerOutAll(srcIP.String())
 		var flags tcpFlags
 		var body []byte
 		if out != nil {
@@ -587,7 +609,6 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		cy.ourSeq += uint32(len(body))
 
 	case t.ACK && !t.SYN && len(payload) == 0:
-		// Bare ACK from client. State transition only.
 		if exists {
 			cy.state = cycleEstablished
 		}
@@ -608,6 +629,21 @@ func (c *CycleConn) deliverRead(data []byte, addr *net.UDPAddr) {
 	select {
 	case c.readQueue <- readPacket{data: buf, addr: addr}:
 	case <-c.ctx.Done():
+	}
+}
+
+// unpackAndDeliver splits a length-prefixed multi-packet payload (see
+// popServerOutAll) and delivers each contained KCP packet to the read queue.
+func (c *CycleConn) unpackAndDeliver(payload []byte, addr *net.UDPAddr) {
+	for len(payload) >= 2 {
+		n := binary.BigEndian.Uint16(payload[:2])
+		payload = payload[2:]
+		if int(n) > len(payload) {
+			flog.Debugf("cycle: malformed bundle (claim=%d remain=%d), dropping rest", n, len(payload))
+			return
+		}
+		c.deliverRead(payload[:n], addr)
+		payload = payload[n:]
 	}
 }
 
@@ -666,12 +702,12 @@ func (c *CycleConn) sendTCP(cy *cycle, flags tcpFlags, payload []byte) error {
 		TOS:      0,
 		Protocol: layers.IPProtocolTCP,
 		Flags:    layers.IPv4DontFragment,
-		SrcIP:    cy.srcIP,
-		DstIP:    cy.dstIP,
+		SrcIP:    cy.localIP,
+		DstIP:    cy.remoteIP,
 	}
 	t := &layers.TCP{
-		SrcPort: layers.TCPPort(cy.srcPort),
-		DstPort: layers.TCPPort(cy.dstPort),
+		SrcPort: layers.TCPPort(cy.localPort),
+		DstPort: layers.TCPPort(cy.remotePort),
 		Window:  65535,
 		Seq:     cy.ourSeq,
 	}
@@ -703,9 +739,17 @@ func (c *CycleConn) sendTCP(cy *cycle, flags tcpFlags, payload []byte) error {
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 	if err := gopacket.SerializeLayers(buf, opts, eth, ip4, t, gopacket.Payload(payload)); err != nil {
+		flog.Debugf("cycle/sendTCP: serialize error: %v", err)
 		return fmt.Errorf("cycle: serialize: %w", err)
 	}
-	return c.sendHandle.WritePacketData(buf.Bytes())
+	out := buf.Bytes()
+	flog.Debugf("cycle/sendTCP: writing %d bytes flags=%d %s:%d→%s:%d seq=%d ack=%d",
+		len(out), flags, cy.localIP, cy.localPort, cy.remoteIP, cy.remotePort, t.Seq, t.Ack)
+	if err := c.sendHandle.WritePacketData(out); err != nil {
+		flog.Debugf("cycle/sendTCP: WritePacketData error: %v", err)
+		return err
+	}
+	return nil
 }
 
 func synOptions() []layers.TCPOption {
