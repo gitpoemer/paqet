@@ -138,6 +138,11 @@ type CycleConn struct {
 	isServer bool
 	isLoop   bool // false = cycle mode, true = loop mode
 
+	// Which TCP flag combo the server uses for data-bearing segments back
+	// to the client. "PA" (default), "A" (bare ACK + data), "SA" (data
+	// in SYN-ACK, TCP-Fast-Open style). See conf.Transport.CycleDataFlag.
+	serverDataFlag string
+
 	sendHandle *pcap.Handle
 	recvHandle *pcap.Handle
 
@@ -186,8 +191,8 @@ type CycleConn struct {
 // NewCycleServer creates a PacketConn in server mode for cycle/loop modes.
 // The server's wire behavior is identical between the two — the mode flag
 // only changes client-side cycle lifecycle.
-func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, isLoop bool) (*CycleConn, error) {
-	cc, err := newCycleConn(ctx, cfg, true, isLoop, listenPort, nil)
+func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, isLoop bool, serverDataFlag string) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, true, isLoop, listenPort, nil, serverDataFlag)
 	if err != nil {
 		return nil, err
 	}
@@ -197,8 +202,8 @@ func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, i
 }
 
 // NewCycleClient creates a PacketConn in client mode for cycle/loop modes.
-func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr, isLoop bool) (*CycleConn, error) {
-	cc, err := newCycleConn(ctx, cfg, false, isLoop, 0, serverAddr)
+func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr, isLoop bool, serverDataFlag string) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, false, isLoop, 0, serverAddr, serverDataFlag)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +218,7 @@ func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPA
 	return cc, nil
 }
 
-func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop bool, listenPort uint16, serverAddr *net.UDPAddr) (*CycleConn, error) {
+func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop bool, listenPort uint16, serverAddr *net.UDPAddr, serverDataFlag string) (*CycleConn, error) {
 	sendH, err := openCyclePcap(cfg, pcap.DirectionOut)
 	if err != nil {
 		return nil, fmt.Errorf("cycle: open send pcap: %w", err)
@@ -239,20 +244,24 @@ func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop 
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
+	if serverDataFlag == "" {
+		serverDataFlag = "PA"
+	}
 	cc := &CycleConn{
-		cfg:        cfg,
-		isServer:   isServer,
-		isLoop:     isLoop,
-		sendHandle: sendH,
-		recvHandle: recvH,
-		srcMAC:     cfg.Interface.HardwareAddr,
-		serverAddr: serverAddr,
-		listenPort: listenPort,
-		cycles:     make(map[string]*cycle),
-		serverOut:  make(map[string][][]byte),
-		readQueue:  make(chan readPacket, cycleQueueCap),
-		ctx:        ctx,
-		cancel:     cancel,
+		cfg:            cfg,
+		isServer:       isServer,
+		isLoop:         isLoop,
+		serverDataFlag: serverDataFlag,
+		sendHandle:     sendH,
+		recvHandle:     recvH,
+		srcMAC:         cfg.Interface.HardwareAddr,
+		serverAddr:     serverAddr,
+		listenPort:     listenPort,
+		cycles:         make(map[string]*cycle),
+		serverOut:      make(map[string][][]byte),
+		readQueue:      make(chan readPacket, cycleQueueCap),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 	if cfg.IPv4.Addr != nil {
 		cc.srcIP = cfg.IPv4.Addr.IP
@@ -662,7 +671,12 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 			flog.Debugf("cycle/client: SA ack mismatch (got %d expected %d) for cy %s — dropping (likely injection)", t.Ack, cy.ourSeq+1, cy.key())
 			return
 		}
-		cy.theirSeq = t.Seq
+		// In "SA" data-flag mode the server piggybacks KCP data on the
+		// SYN-ACK itself. Extract it before completing the handshake.
+		if len(payload) > 0 {
+			c.unpackAndDeliver(payload, c.serverAddr)
+		}
+		cy.theirSeq = t.Seq + uint32(len(payload))
 		cy.ourSeq = t.Ack
 		cy.state = cycleEstablished
 		if cy.pending != nil {
@@ -676,20 +690,20 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 			cy.state = cycleDataDelivered
 		}
 
-	case t.PSH && t.ACK && len(payload) > 0:
-		// Server's [PA] response — accept only on a cycle past handshake.
-		// We do NOT update theirSeq from incoming packets: in hostile-
-		// middlebox environments any state we derive from the wire is
-		// suspect. The payload bytes are still safe because KCP's AEAD
-		// (aes-128-gcm) authenticates the entire KCP frame; injected
-		// garbage just fails decryption and gets dropped silently by KCP.
+	case t.ACK && !t.SYN && len(payload) > 0:
+		// Server data-bearing segment. May be either [PA] (PSH-ACK with
+		// payload, the default mode) or [.] (bare ACK with payload, the
+		// "A" data-flag mode). Same handling — extract bundled KCP
+		// packets and deliver to KCP. KCP's AEAD authenticates each
+		// packet so any injection that survived to this point fails
+		// integrity and gets dropped silently inside KCP.
 		if cy.state != cycleEstablished && cy.state != cycleDataDelivered {
 			return
 		}
 		c.unpackAndDeliver(payload, c.serverAddr)
 
 	case t.ACK && !t.SYN && len(payload) == 0:
-		// Bare ACK from server. Nothing to do.
+		// Bare ACK from server with no payload. Nothing to do.
 
 	case t.RST:
 		// The carrier may inject RSTs to forcibly kill flows. Don't
@@ -727,12 +741,20 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		c.cyclesMu.Lock()
 		c.cycles[key] = cy
 		c.cyclesMu.Unlock()
-		if err := c.sendTCP(cy, tcpFlagsSYNACK, nil); err != nil {
+		// In "SA" data-flag mode the server piggybacks queued KCP data
+		// into the SYN-ACK itself (TCP Fast Open style). This is
+		// because some hostile carriers drop server→client packets
+		// with payload UNLESS they're on this specific flag combo.
+		var saBody []byte
+		if c.serverDataFlag == "SA" {
+			saBody = c.popServerOutAll(srcIP.String())
+		}
+		if err := c.sendTCP(cy, tcpFlagsSYNACK, saBody); err != nil {
 			flog.Debugf("cycle/server: SA send failed for %s: %v", key, err)
 			c.dropCycle(cy)
 			return
 		}
-		cy.ourSeq++ // SYN consumes one seq slot
+		cy.ourSeq += 1 + uint32(len(saBody)) // SYN consumes 1 seq slot, body adds its bytes
 
 	case t.PSH && t.ACK && len(payload) > 0:
 		if !exists {
@@ -749,11 +771,22 @@ func (c *CycleConn) handleIncomingServer(srcIP net.IP, t *layers.TCP, payload []
 		}
 		cy.state = cycleDataDelivered
 		c.deliverRead(payload, &net.UDPAddr{IP: srcIP, Port: 0})
-		out := c.popServerOutAll(srcIP.String())
+		// Pick the flag for the server's data response per config. In "SA"
+		// mode the data has already been delivered via the SYN-ACK back-
+		// channel, so we send only a bare ACK here.
+		var out []byte
+		if c.serverDataFlag != "SA" {
+			out = c.popServerOutAll(srcIP.String())
+		}
 		var flags tcpFlags
 		var body []byte
 		if out != nil {
-			flags = tcpFlagsPSHACK
+			switch c.serverDataFlag {
+			case "A":
+				flags = tcpFlagsACK
+			default: // "PA"
+				flags = tcpFlagsPSHACK
+			}
 			body = out
 		} else {
 			flags = tcpFlagsACK
@@ -878,6 +911,11 @@ func (c *CycleConn) sendTCP(cy *cycle, flags tcpFlags, payload []byte) error {
 		t.SYN = true
 		t.ACK = true
 		t.Ack = cy.theirSeq + 1
+		// TCP Fast Open style: SYN-ACK can carry payload. We don't set
+		// the TFO option header (it's a real-TCP feature with cookie
+		// negotiation we don't need), but raw TCP allows data in any
+		// flag combo. The receiver's pcap reader extracts payload by
+		// IP+TCP length math, not by flag-aware parsing.
 		t.Options = synOptions()
 	case tcpFlagsACK:
 		t.ACK = true

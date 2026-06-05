@@ -29,7 +29,29 @@ type Transport struct {
 	//                    periodic re-handshake mid-stream to reset
 	//                    middlebox inspection state.
 	Mode string `yaml:"mode"`
-	KCP  *KCP   `yaml:"kcp"`
+	// CycleDataFlag controls which TCP flag combo the server uses when
+	// piggybacking KCP data back to the client in handshake_cycle /
+	// handshake_loop modes. Some hostile carriers content-sniff inbound
+	// packets and silently drop server→client segments based on flag /
+	// data combination, while letting other flag combos pass. The
+	// observed pattern for the Iranian mobile carrier we tested was:
+	// zero-length [S.] and [.] survive, all [P.] with payload dropped.
+	// This option lets you try alternative flag combos for the
+	// server's data-bearing segments.
+	//
+	//   "PA" (default) — [PSH-ACK] with payload. Semantically correct,
+	//                    widely accepted. Use this on benign paths.
+	//   "A"            — bare [ACK] with payload (drop the PSH bit).
+	//                    Wire pattern looks like "in-flight data on an
+	//                    established flow without urgency hint". Less
+	//                    standard but valid TCP.
+	//   "SA"           — TCP Fast Open style: server stuffs queued KCP
+	//                    data into the SYN-ACK response itself. Cycle
+	//                    becomes: client [S] → server [S.]+data →
+	//                    client [PA]+data. Test against carriers that
+	//                    let zero-length SAs pass.
+	CycleDataFlag string `yaml:"cycle_data_flag"`
+	KCP           *KCP   `yaml:"kcp"`
 }
 
 func (t *Transport) setDefaults(role string) {
@@ -60,6 +82,10 @@ func (t *Transport) setDefaults(role string) {
 		t.UDPBuf = 2 * 1024
 	}
 
+	if t.CycleDataFlag == "" {
+		t.CycleDataFlag = "PA"
+	}
+
 	switch t.Protocol {
 	case "kcp":
 		t.KCP.setDefaults(role)
@@ -77,6 +103,11 @@ func (t *Transport) validate() []error {
 	validModes := []string{"raw", "tcp_carrier", "handshake_cycle", "handshake_loop"}
 	if !slices.Contains(validModes, t.Mode) {
 		errors = append(errors, fmt.Errorf("transport mode must be one of: %v", validModes))
+	}
+
+	validDataFlags := []string{"PA", "A", "SA"}
+	if !slices.Contains(validDataFlags, t.CycleDataFlag) {
+		errors = append(errors, fmt.Errorf("transport cycle_data_flag must be one of: %v", validDataFlags))
 	}
 
 	if t.Conn < 1 || t.Conn > 256 {
