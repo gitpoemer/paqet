@@ -65,7 +65,22 @@ type Transport struct {
 	// Go's time.ParseDuration ("500ms", "1s", "2s500ms").
 	LoopRollInterval_ string        `yaml:"loop_roll_interval"`
 	LoopRollInterval  time.Duration `yaml:"-"`
-	KCP               *KCP          `yaml:"kcp"`
+	// CyclePoolSize — for handshake_cycle mode, how many cycles to keep
+	// "warm" in a round-robin pool. Default 1 = legacy behaviour (one
+	// fresh cycle per KCP packet, max port churn). Set to N>1 to spread
+	// KCP packets across N parallel cycles so the carrier sees a handful
+	// of medium-lived flows instead of a flood of one-shot ones.
+	// Reasonable values: 2-8. Capped at 64.
+	CyclePoolSize int `yaml:"cycle_pool_size"`
+	// CyclePoolMaxPackets — for handshake_cycle mode, max outbound data
+	// packets sent on a single pool cycle before it's retired (FIN'd) and
+	// replaced with a fresh handshake. Default 1 = each cycle carries
+	// exactly one client→server KCP packet (matches the carrier per-flow
+	// budget we observed: ~2 each direction including handshake). Set
+	// higher (e.g. 2-4) only if the carrier tolerates more data packets
+	// per flow. Capped at 32.
+	CyclePoolMaxPackets int  `yaml:"cycle_pool_max_packets"`
+	KCP                 *KCP `yaml:"kcp"`
 }
 
 func (t *Transport) setDefaults(role string) {
@@ -101,6 +116,12 @@ func (t *Transport) setDefaults(role string) {
 	}
 	if t.LoopRollInterval_ == "" {
 		t.LoopRollInterval_ = "8s"
+	}
+	if t.CyclePoolSize == 0 {
+		t.CyclePoolSize = 1
+	}
+	if t.CyclePoolMaxPackets == 0 {
+		t.CyclePoolMaxPackets = 1
 	}
 
 	switch t.Protocol {
@@ -140,6 +161,13 @@ func (t *Transport) validate() []error {
 
 	if t.Conn < 1 || t.Conn > 256 {
 		errors = append(errors, fmt.Errorf("KCP conn must be between 1-256 connections"))
+	}
+
+	if t.CyclePoolSize < 1 || t.CyclePoolSize > 64 {
+		errors = append(errors, fmt.Errorf("transport cycle_pool_size must be between 1-64"))
+	}
+	if t.CyclePoolMaxPackets < 1 || t.CyclePoolMaxPackets > 32 {
+		errors = append(errors, fmt.Errorf("transport cycle_pool_max_packets must be between 1-32"))
 	}
 
 	switch t.Protocol {

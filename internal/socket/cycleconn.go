@@ -117,6 +117,14 @@ func cycleKey(ip net.IP, port uint16) string {
 	return fmt.Sprintf("%s:%d", ip.String(), port)
 }
 
+// cycleSlot is a client-side cycle-pool slot. `sent` counts outbound
+// data packets emitted on `cy`; once it reaches poolMaxPkt, the slot is
+// retired and replaced by a fresh handshake on the next round-robin pick.
+type cycleSlot struct {
+	cy   *cycle
+	sent int
+}
+
 // CycleConn implements net.PacketConn for both the handshake_cycle and
 // handshake_loop transport modes. The two modes share the same wire-level
 // state machine and packet crafting; they differ only in cycle lifecycle:
@@ -147,6 +155,14 @@ type CycleConn struct {
 	// being closed and rolled to a fresh source port.
 	loopRollInterval time.Duration
 
+	// Client-only cycle-pool config (handshake_cycle mode). poolSize=1
+	// and poolMaxPkt=1 reproduce legacy "one cycle per KCP packet"
+	// behaviour. Larger values keep multiple cycles warm in a
+	// round-robin and let each carry multiple KCP packets before
+	// rotation.
+	poolSize   int
+	poolMaxPkt int
+
 	sendHandle *pcap.Handle
 	recvHandle *pcap.Handle
 
@@ -167,6 +183,15 @@ type CycleConn struct {
 	// Client-only loop mode: the currently active cycle, swapped on roll.
 	activeLoopMu sync.Mutex
 	activeLoop   *cycle
+
+	// Client-only: cycle pool for handshake_cycle mode. Each slot holds
+	// at most one "warm" cycle plus a count of data packets sent on it.
+	// When sent >= poolMaxPkt, the slot is retired (cycle's expiry is
+	// accelerated so the sweeper FIN+drops it) and the next WriteTo
+	// mints a fresh cycle into that slot.
+	poolMu     sync.Mutex
+	pool       []cycleSlot
+	poolCursor uint64
 
 	// Client-only: port pool cursor (atomic for cheap allocation).
 	portCursor atomic.Uint32
@@ -194,7 +219,7 @@ type CycleConn struct {
 
 // NewCycleServer creates a PacketConn in server mode for cycle/loop modes.
 func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, isLoop bool, serverDataFlag string, loopRollInterval time.Duration) (*CycleConn, error) {
-	cc, err := newCycleConn(ctx, cfg, true, isLoop, listenPort, nil, serverDataFlag, loopRollInterval)
+	cc, err := newCycleConn(ctx, cfg, true, isLoop, listenPort, nil, serverDataFlag, loopRollInterval, 1, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -204,8 +229,10 @@ func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, i
 }
 
 // NewCycleClient creates a PacketConn in client mode for cycle/loop modes.
-func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr, isLoop bool, serverDataFlag string, loopRollInterval time.Duration) (*CycleConn, error) {
-	cc, err := newCycleConn(ctx, cfg, false, isLoop, 0, serverAddr, serverDataFlag, loopRollInterval)
+// poolSize and poolMaxPkt control the handshake_cycle pool (ignored when
+// isLoop is true). Both default to 1 when 0 is passed (legacy behaviour).
+func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr, isLoop bool, serverDataFlag string, loopRollInterval time.Duration, poolSize, poolMaxPkt int) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, false, isLoop, 0, serverAddr, serverDataFlag, loopRollInterval, poolSize, poolMaxPkt)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +247,7 @@ func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPA
 	return cc, nil
 }
 
-func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop bool, listenPort uint16, serverAddr *net.UDPAddr, serverDataFlag string, loopRollInterval time.Duration) (*CycleConn, error) {
+func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop bool, listenPort uint16, serverAddr *net.UDPAddr, serverDataFlag string, loopRollInterval time.Duration, poolSize, poolMaxPkt int) (*CycleConn, error) {
 	sendH, err := openCyclePcap(cfg, pcap.DirectionOut)
 	if err != nil {
 		return nil, fmt.Errorf("cycle: open send pcap: %w", err)
@@ -252,12 +279,21 @@ func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop 
 	if loopRollInterval <= 0 {
 		loopRollInterval = defaultLoopRollInterval
 	}
+	if poolSize < 1 {
+		poolSize = 1
+	}
+	if poolMaxPkt < 1 {
+		poolMaxPkt = 1
+	}
 	cc := &CycleConn{
 		cfg:              cfg,
 		isServer:         isServer,
 		isLoop:           isLoop,
 		serverDataFlag:   serverDataFlag,
 		loopRollInterval: loopRollInterval,
+		poolSize:         poolSize,
+		poolMaxPkt:       poolMaxPkt,
+		pool:             make([]cycleSlot, poolSize),
 		sendHandle:       sendH,
 		recvHandle:       recvH,
 		srcMAC:           cfg.Interface.HardwareAddr,
@@ -420,12 +456,85 @@ func (c *CycleConn) clientWriteTo(p []byte, addr net.Addr) (int, error) {
 	return c.cycleWriteTo(p)
 }
 
-// cycleWriteTo: handshake_cycle behavior — fresh cycle per KCP packet.
+// cycleWriteTo: handshake_cycle behavior — round-robin across c.pool of
+// "warm" cycles. Each pool slot carries up to c.poolMaxPkt outbound data
+// packets before being retired (FIN'd by the sweeper) and replaced with
+// a fresh handshake.
+//
+// Pool semantics:
+//   - empty slot or retired cycle  → mint a fresh handshake; queue payload
+//                                    on cy.pending so the SA-arrival path
+//                                    drains it as the first [PA].
+//   - cycle in SynSent (handshake) → append payload to cy.pending; same
+//                                    drain handles the rest.
+//   - cycle established            → send [PA] immediately with payload.
+//   - slot.sent reaches poolMaxPkt → retire after this packet (FIN via
+//                                    expedited sweeper expiry).
+//
+// poolSize=1 & poolMaxPkt=1 (the defaults) reproduce the legacy "fresh
+// cycle per KCP packet" behaviour exactly.
 func (c *CycleConn) cycleWriteTo(p []byte) (int, error) {
-	localPort := c.allocPort()
-	remoteIP := c.serverAddr.IP
-	remotePort := uint16(c.serverAddr.Port)
+	c.poolMu.Lock()
+	idx := int(c.poolCursor % uint64(c.poolSize))
+	c.poolCursor++
+	slot := &c.pool[idx]
+	cy := slot.cy
+	// Treat closed / nil as empty.
+	needNew := cy == nil || cy.state == cycleClosed
+	c.poolMu.Unlock()
 
+	if needNew {
+		fresh, err := c.startCycleWithPayload(p)
+		if err != nil {
+			return 0, err
+		}
+		c.poolMu.Lock()
+		c.pool[idx] = cycleSlot{cy: fresh, sent: 1}
+		c.poolMu.Unlock()
+		c.retireIfMaxed(idx)
+		return len(p), nil
+	}
+
+	// Cycle exists. State-dependent send.
+	if cy.state == cycleSynSent {
+		// Handshake in flight — queue and let the SA handler drain.
+		cy.pendingMu.Lock()
+		cy.pending = append(cy.pending, append([]byte(nil), p...))
+		cy.pendingMu.Unlock()
+	} else {
+		// Established (or post-handshake) — send [PA] inline.
+		if err := c.sendTCP(cy, tcpFlagsPSHACK, p); err != nil {
+			flog.Debugf("cycle/client: PA send failed on pool cycle localPort=%d: %v", cy.localPort, err)
+			// Mark slot empty so the next WriteTo re-mints.
+			c.poolMu.Lock()
+			if c.pool[idx].cy == cy {
+				c.pool[idx] = cycleSlot{}
+			}
+			c.poolMu.Unlock()
+			return 0, err
+		}
+		cy.ourSeq += uint32(len(p))
+	}
+
+	c.poolMu.Lock()
+	if c.pool[idx].cy == cy {
+		c.pool[idx].sent++
+	}
+	c.poolMu.Unlock()
+
+	wc := c.writeCount.Add(1)
+	if wc <= 5 || wc%500 == 0 {
+		flog.Debugf("cycle/client: pool slot=%d localPort=%d sent=%d wc=%d kcpLen=%d",
+			idx, cy.localPort, slot.sent+1, wc, len(p))
+	}
+	c.retireIfMaxed(idx)
+	return len(p), nil
+}
+
+// startCycleWithPayload mints a fresh cycle, queues p as the initial
+// payload to be drained when [SA] arrives, sends [SYN], and returns it.
+func (c *CycleConn) startCycleWithPayload(p []byte) (*cycle, error) {
+	localPort := c.allocPort()
 	var seqBytes [4]byte
 	_, _ = rand.Read(seqBytes[:])
 	ourSeq := binary.BigEndian.Uint32(seqBytes[:])
@@ -433,8 +542,8 @@ func (c *CycleConn) cycleWriteTo(p []byte) (int, error) {
 	cy := &cycle{
 		localIP:    c.srcIP,
 		localPort:  localPort,
-		remoteIP:   remoteIP,
-		remotePort: remotePort,
+		remoteIP:   c.serverAddr.IP,
+		remotePort: uint16(c.serverAddr.Port),
 		mapKey:     cycleKey(c.srcIP, localPort),
 		ourSeq:     ourSeq,
 		state:      cycleSynSent,
@@ -448,13 +557,29 @@ func (c *CycleConn) cycleWriteTo(p []byte) (int, error) {
 
 	if err := c.sendTCP(cy, tcpFlagsSYN, nil); err != nil {
 		c.dropCycle(cy)
-		return 0, err
+		return nil, err
 	}
-	wc := c.writeCount.Add(1)
-	if wc <= 5 || wc%500 == 0 {
-		flog.Debugf("cycle/client: cycle started localPort=%d wc=%d kcpLen=%d", localPort, wc, len(p))
+	return cy, nil
+}
+
+// retireIfMaxed checks slot[idx]; if its `sent` counter has reached
+// poolMaxPkt, the cycle is removed from the slot and its expiry is
+// pulled forward so the sweeper FIN+drops it within ~1s. Server
+// responses on the retired cycle still get delivered while it lingers.
+func (c *CycleConn) retireIfMaxed(idx int) {
+	c.poolMu.Lock()
+	slot := c.pool[idx]
+	if slot.cy == nil || slot.sent < c.poolMaxPkt {
+		c.poolMu.Unlock()
+		return
 	}
-	return len(p), nil
+	cy := slot.cy
+	c.pool[idx] = cycleSlot{}
+	c.poolMu.Unlock()
+
+	// Pull expiry forward so the sweeper FINs this cycle soon, but
+	// leave a brief window for the server's response to land.
+	cy.expires = time.Now().Add(500 * time.Millisecond)
 }
 
 // loopWriteTo: handshake_loop behavior — long-lived cycle, rolled by the
@@ -722,6 +847,9 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 			// Post-handshake SA (SAALL mode). Treat as data delivery.
 			if len(payload) > 0 {
 				c.unpackAndDeliver(payload, c.serverAddr)
+				// Advance theirSeq so any subsequent PA we send on
+				// this cycle (pool mode) carries a plausible ack.
+				cy.theirSeq = t.Seq + uint32(len(payload))
 			}
 		}
 
@@ -736,6 +864,9 @@ func (c *CycleConn) handleIncomingClient(srcIP net.IP, t *layers.TCP, payload []
 			return
 		}
 		c.unpackAndDeliver(payload, c.serverAddr)
+		// Advance theirSeq for ack-number correctness if we send
+		// subsequent PAs on this cycle (pool mode).
+		cy.theirSeq = t.Seq + uint32(len(payload))
 
 	case t.ACK && !t.SYN && len(payload) == 0:
 		// Bare ACK from server with no payload. Nothing to do.

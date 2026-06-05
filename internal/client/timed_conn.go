@@ -48,7 +48,7 @@ func (tc *timedConn) createConn() (tnet.Conn, error) {
 	case "handshake_cycle", "handshake_loop":
 		netCfg := tc.cfg.Network
 		isLoop := tc.cfg.Transport.Mode == "handshake_loop"
-		pConn, err := socket.NewCycleClient(tc.ctx, &netCfg, tc.cfg.Server.Addr, isLoop, tc.cfg.Transport.CycleDataFlag, tc.cfg.Transport.LoopRollInterval)
+		pConn, err := socket.NewCycleClient(tc.ctx, &netCfg, tc.cfg.Server.Addr, isLoop, tc.cfg.Transport.CycleDataFlag, tc.cfg.Transport.LoopRollInterval, tc.cfg.Transport.CyclePoolSize, tc.cfg.Transport.CyclePoolMaxPackets)
 		if err != nil {
 			return nil, fmt.Errorf("could not create %s conn: %w", tc.cfg.Transport.Mode, err)
 		}
