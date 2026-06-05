@@ -64,11 +64,8 @@ const (
 	cycleTimeout          = 5 * time.Second
 	cycleMaxPacket        = 65535
 
-	// Mode B (handshake_loop) — how long a single long-lived flow stays
-	// active before rolling to a fresh source port (and new handshake).
-	// The roll exists to defeat middlebox "long-lived non-standard
-	// connection" detectors that engage on flows >N seconds old.
-	loopRollInterval = 8 * time.Second
+	// Default for Mode B (handshake_loop); configurable via transport.loop_roll_interval.
+	defaultLoopRollInterval = 8 * time.Second
 )
 
 // cycleState marks how far the per-cycle TCP-mimic handshake has progressed.
@@ -143,6 +140,10 @@ type CycleConn struct {
 	// in SYN-ACK, TCP-Fast-Open style). See conf.Transport.CycleDataFlag.
 	serverDataFlag string
 
+	// For handshake_loop mode: how long a single flow stays active before
+	// being closed and rolled to a fresh source port.
+	loopRollInterval time.Duration
+
 	sendHandle *pcap.Handle
 	recvHandle *pcap.Handle
 
@@ -189,10 +190,8 @@ type CycleConn struct {
 }
 
 // NewCycleServer creates a PacketConn in server mode for cycle/loop modes.
-// The server's wire behavior is identical between the two — the mode flag
-// only changes client-side cycle lifecycle.
-func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, isLoop bool, serverDataFlag string) (*CycleConn, error) {
-	cc, err := newCycleConn(ctx, cfg, true, isLoop, listenPort, nil, serverDataFlag)
+func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, isLoop bool, serverDataFlag string, loopRollInterval time.Duration) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, true, isLoop, listenPort, nil, serverDataFlag, loopRollInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -202,8 +201,8 @@ func NewCycleServer(ctx context.Context, cfg *conf.Network, listenPort uint16, i
 }
 
 // NewCycleClient creates a PacketConn in client mode for cycle/loop modes.
-func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr, isLoop bool, serverDataFlag string) (*CycleConn, error) {
-	cc, err := newCycleConn(ctx, cfg, false, isLoop, 0, serverAddr, serverDataFlag)
+func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPAddr, isLoop bool, serverDataFlag string, loopRollInterval time.Duration) (*CycleConn, error) {
+	cc, err := newCycleConn(ctx, cfg, false, isLoop, 0, serverAddr, serverDataFlag, loopRollInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +217,7 @@ func NewCycleClient(ctx context.Context, cfg *conf.Network, serverAddr *net.UDPA
 	return cc, nil
 }
 
-func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop bool, listenPort uint16, serverAddr *net.UDPAddr, serverDataFlag string) (*CycleConn, error) {
+func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop bool, listenPort uint16, serverAddr *net.UDPAddr, serverDataFlag string, loopRollInterval time.Duration) (*CycleConn, error) {
 	sendH, err := openCyclePcap(cfg, pcap.DirectionOut)
 	if err != nil {
 		return nil, fmt.Errorf("cycle: open send pcap: %w", err)
@@ -247,21 +246,25 @@ func newCycleConn(ctx context.Context, cfg *conf.Network, isServer bool, isLoop 
 	if serverDataFlag == "" {
 		serverDataFlag = "PA"
 	}
+	if loopRollInterval <= 0 {
+		loopRollInterval = defaultLoopRollInterval
+	}
 	cc := &CycleConn{
-		cfg:            cfg,
-		isServer:       isServer,
-		isLoop:         isLoop,
-		serverDataFlag: serverDataFlag,
-		sendHandle:     sendH,
-		recvHandle:     recvH,
-		srcMAC:         cfg.Interface.HardwareAddr,
-		serverAddr:     serverAddr,
-		listenPort:     listenPort,
-		cycles:         make(map[string]*cycle),
-		serverOut:      make(map[string][][]byte),
-		readQueue:      make(chan readPacket, cycleQueueCap),
-		ctx:            ctx,
-		cancel:         cancel,
+		cfg:              cfg,
+		isServer:         isServer,
+		isLoop:           isLoop,
+		serverDataFlag:   serverDataFlag,
+		loopRollInterval: loopRollInterval,
+		sendHandle:       sendH,
+		recvHandle:       recvH,
+		srcMAC:           cfg.Interface.HardwareAddr,
+		serverAddr:       serverAddr,
+		listenPort:       listenPort,
+		cycles:           make(map[string]*cycle),
+		serverOut:        make(map[string][][]byte),
+		readQueue:        make(chan readPacket, cycleQueueCap),
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 	if cfg.IPv4.Addr != nil {
 		cc.srcIP = cfg.IPv4.Addr.IP
@@ -517,10 +520,10 @@ func (c *CycleConn) loopStartCycle(initialPayload []byte) (int, error) {
 }
 
 // loopRoller closes the current active cycle and forces a new handshake
-// every loopRollInterval, so the carrier sees a stream of medium-lived
+// every c.loopRollInterval, so the carrier sees a stream of medium-lived
 // connections instead of one long-lived flow.
 func (c *CycleConn) loopRoller() {
-	t := time.NewTicker(loopRollInterval)
+	t := time.NewTicker(c.loopRollInterval)
 	defer t.Stop()
 	for {
 		select {

@@ -3,6 +3,7 @@ package conf
 import (
 	"fmt"
 	"slices"
+	"time"
 )
 
 type Transport struct {
@@ -51,7 +52,14 @@ type Transport struct {
 	//                    client [PA]+data. Test against carriers that
 	//                    let zero-length SAs pass.
 	CycleDataFlag string `yaml:"cycle_data_flag"`
-	KCP           *KCP   `yaml:"kcp"`
+	// LoopRollInterval — for handshake_loop mode, how long a single flow
+	// stays active before being closed and rolled to a new source port.
+	// Default 8s. Tune down (e.g. "1s", "500ms") when the carrier filters
+	// long-lived flows; tune up when it filters too-many-new-flows. Format:
+	// Go's time.ParseDuration ("500ms", "1s", "2s500ms").
+	LoopRollInterval_ string        `yaml:"loop_roll_interval"`
+	LoopRollInterval  time.Duration `yaml:"-"`
+	KCP               *KCP          `yaml:"kcp"`
 }
 
 func (t *Transport) setDefaults(role string) {
@@ -85,6 +93,9 @@ func (t *Transport) setDefaults(role string) {
 	if t.CycleDataFlag == "" {
 		t.CycleDataFlag = "PA"
 	}
+	if t.LoopRollInterval_ == "" {
+		t.LoopRollInterval_ = "8s"
+	}
 
 	switch t.Protocol {
 	case "kcp":
@@ -108,6 +119,17 @@ func (t *Transport) validate() []error {
 	validDataFlags := []string{"PA", "A", "SA"}
 	if !slices.Contains(validDataFlags, t.CycleDataFlag) {
 		errors = append(errors, fmt.Errorf("transport cycle_data_flag must be one of: %v", validDataFlags))
+	}
+
+	if t.LoopRollInterval_ != "" {
+		d, err := time.ParseDuration(t.LoopRollInterval_)
+		if err != nil {
+			errors = append(errors, fmt.Errorf("transport loop_roll_interval %q: %v", t.LoopRollInterval_, err))
+		} else if d < 100*time.Millisecond {
+			errors = append(errors, fmt.Errorf("transport loop_roll_interval too small (min 100ms)"))
+		} else {
+			t.LoopRollInterval = d
+		}
 	}
 
 	if t.Conn < 1 || t.Conn > 256 {
