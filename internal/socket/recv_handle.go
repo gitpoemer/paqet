@@ -36,43 +36,58 @@ func NewRecvHandle(cfg *conf.Network) (*RecvHandle, error) {
 	return &RecvHandle{handle: handle}, nil
 }
 
+// Read returns the next TCP-payload-bearing packet observed on the wire,
+// along with the source UDP-formatted address. Loops past benign captures
+// (handshake-only segments, ARP that slipped past BPF, malformed frames)
+// so the upper PacketConn layer never sees a `(0, nil-addr, nil-err)` short
+// read — which KCP would otherwise interpret as session shutdown. See
+// OPTIMIZE_NOTES.md C3.
 func (h *RecvHandle) Read() ([]byte, net.Addr, error) {
-	data, _, err := h.handle.ReadPacketData()
-	if err != nil {
-		return nil, nil, err
-	}
-	p := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
+	for {
+		data, _, err := h.handle.ReadPacketData()
+		if err != nil {
+			return nil, nil, err
+		}
+		p := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
 
-	addr := &net.UDPAddr{}
+		netLayer := p.NetworkLayer()
+		if netLayer == nil {
+			continue
+		}
 
-	netLayer := p.NetworkLayer()
-	if netLayer == nil {
-		return nil, nil, nil
-	}
-	switch netLayer.LayerType() {
-	case layers.LayerTypeIPv4:
-		addr.IP = netLayer.(*layers.IPv4).SrcIP
-	case layers.LayerTypeIPv6:
-		addr.IP = netLayer.(*layers.IPv6).SrcIP
-	}
+		addr := &net.UDPAddr{}
+		switch netLayer.LayerType() {
+		case layers.LayerTypeIPv4:
+			addr.IP = netLayer.(*layers.IPv4).SrcIP
+		case layers.LayerTypeIPv6:
+			addr.IP = netLayer.(*layers.IPv6).SrcIP
+		default:
+			continue
+		}
 
-	trLayer := p.TransportLayer()
-	if trLayer == nil {
-		return nil, nil, nil
-	}
-	switch trLayer.LayerType() {
-	case layers.LayerTypeTCP:
-		addr.Port = int(trLayer.(*layers.TCP).SrcPort)
-	case layers.LayerTypeUDP:
-		addr.Port = int(trLayer.(*layers.UDP).SrcPort)
-	}
+		trLayer := p.TransportLayer()
+		if trLayer == nil {
+			continue
+		}
+		switch trLayer.LayerType() {
+		case layers.LayerTypeTCP:
+			addr.Port = int(trLayer.(*layers.TCP).SrcPort)
+		case layers.LayerTypeUDP:
+			addr.Port = int(trLayer.(*layers.UDP).SrcPort)
+		default:
+			continue
+		}
 
-	appLayer := p.ApplicationLayer()
-	if appLayer == nil {
-		return nil, nil, nil
+		appLayer := p.ApplicationLayer()
+		if appLayer == nil {
+			continue
+		}
+		payload := appLayer.Payload()
+		if len(payload) == 0 {
+			continue
+		}
+		return payload, addr, nil
 	}
-
-	return appLayer.Payload(), addr, nil
 }
 
 func (h *RecvHandle) Close() {
