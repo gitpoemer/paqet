@@ -12,13 +12,18 @@ import (
 )
 
 type timedConn struct {
-	cfg  *conf.Conf
-	conn tnet.Conn
+	cfg *conf.Conf
 
-	// mu guards recovery (`createConn`) so multiple stream-openers don't
-	// each rebuild the same conn in parallel. Stream operations on a healthy
-	// conn don't take it.
-	mu sync.Mutex
+	// mu guards both reads and writes of `conn`. Reads take RLock (the
+	// fast path on a healthy session); recovery writes take Lock.
+	//
+	// In v1.0.0-alpha.20-optimize `mu` was sync.Mutex and the happy-path
+	// read of `conn` happened unguarded, which raced against an in-flight
+	// recovery that briefly set conn=nil — the consumer could observe nil
+	// and panic on conn.Ping(false). See OPTIMIZE_NOTES.md review pass for
+	// the full root-cause writeup.
+	mu   sync.RWMutex
+	conn tnet.Conn
 
 	ctx context.Context
 }

@@ -21,34 +21,70 @@ const newStrmMaxRetries = 4
 // without holding the client-wide lock. Ping/createConn used to run inside
 // c.mu which serialized every consumer behind a single (potentially slow) DNS
 // + KCP handshake.
+//
+// Concurrency model on tc:
+//   - tc.mu.RLock() for the happy-path read of tc.conn so the load races
+//     against an in-flight recovery WITHOUT a chance of observing a nil
+//     pointer. RLock is contention-free against other RLock holders.
+//   - tc.mu.Lock() for recovery. Released only after either (a) we've
+//     installed a working fresh conn, or (b) we've decided to leave the
+//     old (broken) conn in place because recovery failed.
+//
+// We deliberately do NOT nil out tc.conn on recovery failure. The old
+// broken pointer stays in place; the next caller's Ping() will fail on
+// it and re-enter recovery. v1.0.0-alpha.20-optimize did the opposite
+// and that meant every subsequent caller hit a nil-pointer panic if
+// createConn ever failed — see OPTIMIZE_NOTES.md review pass.
 func (c *Client) newConn() (tnet.Conn, error) {
 	c.mu.Lock()
 	tc := c.iter.Next()
 	c.mu.Unlock()
 
-	if err := tc.conn.Ping(false); err == nil {
-		return tc.conn, nil
+	// Happy path: read tc.conn under RLock (no contention with other
+	// readers, blocks against an in-flight recovery writer).
+	tc.mu.RLock()
+	current := tc.conn
+	tc.mu.RUnlock()
+	if current != nil {
+		if err := current.Ping(false); err == nil {
+			return current, nil
+		}
 	}
 
-	// Recover under tc's own mutex so other Conn-holders aren't blocked.
+	// Recovery: writer lock.
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	// Re-check after acquiring — another goroutine may have already healed it.
-	if err := tc.conn.Ping(false); err == nil {
-		return tc.conn, nil
+	// Re-check after upgrading — another goroutine may have already healed
+	// the conn while we were waiting for the write lock.
+	if tc.conn != nil {
+		if err := tc.conn.Ping(false); err == nil {
+			return tc.conn, nil
+		}
 	}
 
 	flog.Infof("connection lost, recreating...")
-	if tc.conn != nil {
-		tc.conn.Close()
-		tc.conn = nil
-	}
 	fresh, err := tc.createConn()
 	if err != nil {
+		// Leave whatever was in tc.conn alone. If it's a closed/broken
+		// conn, the next caller's Ping will fail on it and we'll retry
+		// recovery. If it's nil (very first call hit an error here),
+		// the next caller's Ping path skips it via the nil-check above
+		// and also retries. We never write nil here, so we never poison
+		// the pointer with a worse sentinel than what was there before.
 		return nil, fmt.Errorf("recreate connection: %w", err)
 	}
+
+	// Swap to fresh first, then close the old one — anyone who already
+	// loaded the old pointer via the RLock above gets to use it until
+	// they release their last reference. Their next Ping will fail and
+	// they'll re-enter recovery; the bounded retry budget in newStrm
+	// keeps that from looping.
+	old := tc.conn
 	tc.conn = fresh
+	if old != nil {
+		old.Close()
+	}
 	return tc.conn, nil
 }
 
