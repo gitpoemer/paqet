@@ -7,8 +7,18 @@ import (
 	"paqet/internal/tnet"
 )
 
+// UDP returns the stream that should carry datagrams between (lAddr, tAddr).
+// Returns (strm, isNew, key, nil) so the caller can register a per-stream
+// reader goroutine exactly once per key.
+//
+// Closes the check-then-act race in the old code: two datagrams from the
+// same (lAddr, tAddr) arriving concurrently both saw "no strm" under RLock,
+// both newStrm()'d, and both wrote to the map — second writer silently
+// leaked the first stream. Now we re-check under WLock before insert and
+// close the loser if we lost the race. See OPTIMIZE_NOTES.md I4.
 func (c *Client) UDP(lAddr, tAddr string) (tnet.Strm, bool, uint64, error) {
 	key := hash.AddrPair(lAddr, tAddr)
+
 	c.udpPool.mu.RLock()
 	if strm, exists := c.udpPool.strms[key]; exists {
 		c.udpPool.mu.RUnlock()
@@ -38,6 +48,13 @@ func (c *Client) UDP(lAddr, tAddr string) (tnet.Strm, bool, uint64, error) {
 	}
 
 	c.udpPool.mu.Lock()
+	if winner, exists := c.udpPool.strms[key]; exists {
+		// Another goroutine won the race while we were minting our strm.
+		c.udpPool.mu.Unlock()
+		flog.Debugf("UDP race: discarding our stream %d, reusing %d for %s -> %s", strm.SID(), winner.SID(), lAddr, tAddr)
+		strm.Close()
+		return winner, false, key, nil
+	}
 	c.udpPool.strms[key] = strm
 	c.udpPool.mu.Unlock()
 

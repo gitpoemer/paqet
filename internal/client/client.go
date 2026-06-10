@@ -35,7 +35,6 @@ func (c *Client) Start(ctx context.Context) error {
 		flog.Debugf("client connection %d created successfully", i+1)
 		c.iter.Items = append(c.iter.Items, tc)
 	}
-	go c.ticker(ctx)
 
 	go func() {
 		<-ctx.Done()

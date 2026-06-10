@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"paqet/internal/conf"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -20,6 +21,8 @@ type PacketConn struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	closeOnce sync.Once
 }
 
 // &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}
@@ -106,16 +109,22 @@ func (c *PacketConn) WriteTo(data []byte, addr net.Addr) (n int, err error) {
 	return len(data), nil
 }
 
+// Close is idempotent and synchronous. The old code spawned a goroutine per
+// handle on every Close call — and kcp/conn.go::Close, listener teardown,
+// and panic-paths all call this; multiple Close calls would each fan out
+// fresh goroutines. Plus the caller had no way to wait for pcap cleanup,
+// which matters on Windows where a stranded npcap handle blocks restarts.
+// See OPTIMIZE_NOTES.md I5.
 func (c *PacketConn) Close() error {
-	c.cancel()
-
-	if c.sendHandle != nil {
-		go c.sendHandle.Close()
-	}
-	if c.recvHandle != nil {
-		go c.recvHandle.Close()
-	}
-
+	c.closeOnce.Do(func() {
+		c.cancel()
+		if c.sendHandle != nil {
+			c.sendHandle.Close()
+		}
+		if c.recvHandle != nil {
+			c.recvHandle.Close()
+		}
+	})
 	return nil
 }
 
