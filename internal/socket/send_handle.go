@@ -1,6 +1,7 @@
 package socket
 
 import (
+	"container/list"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -17,21 +18,36 @@ import (
 	"github.com/gopacket/gopacket/pcap"
 )
 
-// clientTCPFCap bounds the per-client TCP-flag-iterator map. Each entry is
-// keyed by hash(remoteIP:remotePort); without a cap, a long-running server
-// (especially with a port-rotating client) grew this map without bound,
-// holding RAM proportional to total-clients-ever-seen and stalling the
-// outbound path on map-resize write locks.
+// clientTCPFCap bounds the per-client TCP-flag-iterator LRU. Each entry is
+// ~80 bytes (iterator + list element header + map slot) so 16k entries is
+// ~1.3 MB resident.
 //
-// 4096 is generous for any realistic deployment — far above the count of
-// concurrent clients we'd expect, but well below the size at which Go's
-// map starts hitting noticeable rehash pauses.
-const clientTCPFCap = 4096
+// 16k is well above the realistic count of concurrent active clients on a
+// single paqet server, but high enough that an attacker minting fresh-port
+// connections needs ~16k inserts before evicting a single legitimate
+// client — and legitimate clients with ongoing outbound traffic stay at
+// the LRU front via getClientTCPF, so the typical attacker eviction
+// targets are dormant entries, not active ones.
+const clientTCPFCap = 16384
+
+// clientTCPFEntry is the value stored in the LRU map. `iter` is the
+// per-client flag iterator; `elem` is the entry's position in the LRU
+// list so a hit on getClientTCPF can move-to-front in O(1).
+type clientTCPFEntry struct {
+	iter *iterator.Iterator[conf.TCPF]
+	elem *list.Element // points back to the list node holding the map key
+}
 
 type TCPF struct {
 	tcpF       iterator.Iterator[conf.TCPF]
-	clientTCPF map[uint64]*iterator.Iterator[conf.TCPF]
-	mu         sync.RWMutex
+	clientTCPF map[uint64]*clientTCPFEntry
+	// LRU ordering: front = most recently used, back = oldest.
+	// container/list element values are the uint64 map keys.
+	lru *list.List
+	// Single Mutex: both getClientTCPF (move-to-front) and
+	// setClientTCPF (insert/evict) mutate the list, so RWMutex would
+	// degrade to Lock on every call anyway.
+	mu sync.Mutex
 }
 
 type SendHandle struct {
@@ -67,7 +83,11 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 	sh := &SendHandle{
 		handle:  handle,
 		srcPort: uint16(cfg.Port),
-		tcpF:    TCPF{tcpF: iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF}, clientTCPF: make(map[uint64]*iterator.Iterator[conf.TCPF])},
+		tcpF: TCPF{
+			tcpF:       iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF},
+			clientTCPF: make(map[uint64]*clientTCPFEntry, clientTCPFCap),
+			lru:        list.New(),
+		},
 		time:    uint32(time.Now().UnixNano() / int64(time.Millisecond)),
 		ethPool: sync.Pool{
 			New: func() any {
@@ -218,33 +238,52 @@ func (h *SendHandle) Write(payload []byte, addr *net.UDPAddr) error {
 }
 
 func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
-	h.tcpF.mu.RLock()
-	defer h.tcpF.mu.RUnlock()
-	if ff := h.tcpF.clientTCPF[hash.IPAddr(dstIP, dstPort)]; ff != nil {
-		return ff.Next()
+	key := hash.IPAddr(dstIP, dstPort)
+	h.tcpF.mu.Lock()
+	if e, ok := h.tcpF.clientTCPF[key]; ok {
+		// Move-to-front: this client is the most recently used.
+		h.tcpF.lru.MoveToFront(e.elem)
+		f := e.iter.Next()
+		h.tcpF.mu.Unlock()
+		return f
 	}
+	h.tcpF.mu.Unlock()
 	return h.tcpF.tcpF.Next()
 }
 
 func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
 	a := *addr.(*net.UDPAddr)
 	key := hash.IPAddr(a.IP, uint16(a.Port))
+
 	h.tcpF.mu.Lock()
 	defer h.tcpF.mu.Unlock()
 
-	// Bound the map. If we're at the cap and this is a new key, evict an
-	// arbitrary existing entry — map-iteration order is randomized so this
-	// is an approximate-random eviction, no LRU bookkeeping needed for a
-	// cap this size.
-	if len(h.tcpF.clientTCPF) >= clientTCPFCap {
-		if _, exists := h.tcpF.clientTCPF[key]; !exists {
-			for k := range h.tcpF.clientTCPF {
-				delete(h.tcpF.clientTCPF, k)
-				break
-			}
+	if e, ok := h.tcpF.clientTCPF[key]; ok {
+		// Same key, fresh iterator. Move to front.
+		e.iter = &iterator.Iterator[conf.TCPF]{Items: f}
+		h.tcpF.lru.MoveToFront(e.elem)
+		return
+	}
+
+	// New key. If we'd exceed the cap, evict the LRU tail. The legitimate
+	// client whose entry is being moved to the LRU tail by attacker-driven
+	// inserts has presumably gone idle (no outbound traffic means no
+	// move-to-front in getClientTCPF) — evicting them costs the protocol-
+	// negotiated flag pattern but isn't a correctness break, since
+	// getClientTCPF falls back to the default LF iterator on a miss.
+	if h.tcpF.lru.Len() >= clientTCPFCap {
+		if tail := h.tcpF.lru.Back(); tail != nil {
+			evictedKey := tail.Value.(uint64)
+			delete(h.tcpF.clientTCPF, evictedKey)
+			h.tcpF.lru.Remove(tail)
 		}
 	}
-	h.tcpF.clientTCPF[key] = &iterator.Iterator[conf.TCPF]{Items: f}
+
+	elem := h.tcpF.lru.PushFront(key)
+	h.tcpF.clientTCPF[key] = &clientTCPFEntry{
+		iter: &iterator.Iterator[conf.TCPF]{Items: f},
+		elem: elem,
+	}
 }
 
 // dropClientTCPF removes the per-remote iterator. The server calls this when
@@ -256,7 +295,10 @@ func (h *SendHandle) dropClientTCPF(addr net.Addr) {
 	}
 	key := hash.IPAddr(a.IP, uint16(a.Port))
 	h.tcpF.mu.Lock()
-	delete(h.tcpF.clientTCPF, key)
+	if e, ok := h.tcpF.clientTCPF[key]; ok {
+		h.tcpF.lru.Remove(e.elem)
+		delete(h.tcpF.clientTCPF, key)
+	}
 	h.tcpF.mu.Unlock()
 }
 
