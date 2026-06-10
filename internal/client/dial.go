@@ -8,14 +8,21 @@ import (
 	"time"
 )
 
-// newStrmMaxRetries caps how many recovery passes one stream-open will attempt
-// before giving up and returning an error to the caller (which can then drop
-// the inbound connection cleanly).
+// newStrmMaxRetries caps how many recovery passes one stream-open will
+// attempt before giving up and returning an error to the caller (which can
+// then drop the inbound connection cleanly).
 //
-// Old code (master) recursed without bound. A single broken KCP session blew
-// the goroutine stack and wedged every consumer of the client; this is the
-// most likely root cause of the "stops working after a while" symptom.
-const newStrmMaxRetries = 4
+// Total wall-clock budget per stream-open with the exponential backoff in
+// sleepBackoff() is: 50 + 100 + 200 + 400 + 800 ≈ 1.55s. Picked so a
+// recovering link gets a generous-but-bounded window; consumers stuck
+// behind a hard-down server still surface an error promptly enough that
+// the higher layer can drop the inbound conn.
+//
+// Old code (master) recursed without bound. A single broken KCP session
+// blew the goroutine stack and wedged every consumer of the client;
+// this is the most likely root cause of the "stops working after a
+// while" symptom.
+const newStrmMaxRetries = 5
 
 // newConn picks the next *timedConn under c.mu (briefly), then operates on it
 // without holding the client-wide lock. Ping/createConn used to run inside
@@ -115,10 +122,14 @@ func (c *Client) newStrm() (tnet.Strm, error) {
 	return nil, fmt.Errorf("newStrm gave up after %d attempts: %w", newStrmMaxRetries, lastErr)
 }
 
-// sleepBackoff: 50ms, 100ms, 200ms, 400ms — capped at the loop's retry budget.
+// sleepBackoff: 50ms, 100ms, 200ms, 400ms, 800ms.
+//
+// Doubles per attempt up to 800ms — the cap is intentional so retry #5
+// (the last step under newStrmMaxRetries=5) sleeps 800ms, not 1.6s.
+// Total wall-clock budget per newStrm call: 50+100+200+400+800 ≈ 1.55s.
 func sleepBackoff(attempt int) {
 	d := 50 * time.Millisecond
-	for i := 0; i < attempt && d < 500*time.Millisecond; i++ {
+	for i := 0; i < attempt && d < 800*time.Millisecond; i++ {
 		d *= 2
 	}
 	time.Sleep(d)
