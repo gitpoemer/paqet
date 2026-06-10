@@ -17,6 +17,17 @@ import (
 	"github.com/gopacket/gopacket/pcap"
 )
 
+// clientTCPFCap bounds the per-client TCP-flag-iterator map. Each entry is
+// keyed by hash(remoteIP:remotePort); without a cap, a long-running server
+// (especially with a port-rotating client) grew this map without bound,
+// holding RAM proportional to total-clients-ever-seen and stalling the
+// outbound path on map-resize write locks.
+//
+// 4096 is generous for any realistic deployment — far above the count of
+// concurrent clients we'd expect, but well below the size at which Go's
+// map starts hitting noticeable rehash pauses.
+const clientTCPFCap = 4096
+
 type TCPF struct {
 	tcpF       iterator.Iterator[conf.TCPF]
 	clientTCPF map[uint64]*iterator.Iterator[conf.TCPF]
@@ -217,8 +228,35 @@ func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
 
 func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
 	a := *addr.(*net.UDPAddr)
+	key := hash.IPAddr(a.IP, uint16(a.Port))
 	h.tcpF.mu.Lock()
-	h.tcpF.clientTCPF[hash.IPAddr(a.IP, uint16(a.Port))] = &iterator.Iterator[conf.TCPF]{Items: f}
+	defer h.tcpF.mu.Unlock()
+
+	// Bound the map. If we're at the cap and this is a new key, evict an
+	// arbitrary existing entry — map-iteration order is randomized so this
+	// is an approximate-random eviction, no LRU bookkeeping needed for a
+	// cap this size.
+	if len(h.tcpF.clientTCPF) >= clientTCPFCap {
+		if _, exists := h.tcpF.clientTCPF[key]; !exists {
+			for k := range h.tcpF.clientTCPF {
+				delete(h.tcpF.clientTCPF, k)
+				break
+			}
+		}
+	}
+	h.tcpF.clientTCPF[key] = &iterator.Iterator[conf.TCPF]{Items: f}
+}
+
+// dropClientTCPF removes the per-remote iterator. The server calls this when
+// a smux session terminates so we don't accumulate dead entries for ever.
+func (h *SendHandle) dropClientTCPF(addr net.Addr) {
+	a, ok := addr.(*net.UDPAddr)
+	if !ok || a == nil {
+		return
+	}
+	key := hash.IPAddr(a.IP, uint16(a.Port))
+	h.tcpF.mu.Lock()
+	delete(h.tcpF.clientTCPF, key)
 	h.tcpF.mu.Unlock()
 }
 

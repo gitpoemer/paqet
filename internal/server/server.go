@@ -81,7 +81,16 @@ func (s *Server) listen(ctx context.Context, listener tnet.Listener) {
 		flog.Infof("accepted new connection from %s (local: %s)", conn.RemoteAddr(), conn.LocalAddr())
 
 		s.wg.Go(func() {
-			defer conn.Close()
+			remote := conn.RemoteAddr()
+			defer func() {
+				// Drop the per-client TCP-flag iterator entry on the send
+				// handle so the map doesn't accumulate one entry per ever-
+				// connected client. See OPTIMIZE_NOTES.md C2.
+				if s.pConn != nil {
+					s.pConn.DropClientTCPF(remote)
+				}
+				conn.Close()
+			}()
 			s.handleConn(ctx, conn)
 		})
 	}
