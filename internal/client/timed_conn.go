@@ -8,14 +8,19 @@ import (
 	"paqet/internal/socket"
 	"paqet/internal/tnet"
 	"paqet/internal/tnet/kcp"
-	"time"
+	"sync"
 )
 
 type timedConn struct {
-	cfg    *conf.Conf
-	conn   tnet.Conn
-	expire time.Time
-	ctx    context.Context
+	cfg  *conf.Conf
+	conn tnet.Conn
+
+	// mu guards recovery (`createConn`) so multiple stream-openers don't
+	// each rebuild the same conn in parallel. Stream operations on a healthy
+	// conn don't take it.
+	mu sync.Mutex
+
+	ctx context.Context
 }
 
 func newTimedConn(ctx context.Context, cfg *conf.Conf) (*timedConn, error) {
