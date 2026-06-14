@@ -3,6 +3,7 @@ package flog
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,16 +19,20 @@ const (
 )
 
 var (
-	minLevel = Info
+	// minLevel is accessed atomically: SetLevel may be called concurrently
+	// with logging in principle, and the race detector flags non-atomic
+	// reads from the per-log-call gate as a data race. Int32 is the
+	// smallest type sync/atomic supports for our Level (=int) enum.
+	minLevel atomic.Int32
 	logCh    = make(chan string, 1024)
 )
 
 func init() {
-
+	minLevel.Store(int32(Info))
 }
 
 func SetLevel(l int) {
-	minLevel = Level(l)
+	minLevel.Store(int32(l))
 	if l != -1 {
 		go func() {
 			for msg := range logCh {
@@ -37,8 +42,27 @@ func SetLevel(l int) {
 	}
 }
 
+// Enabled reports whether a log call at the given level will emit. Use it
+// at call sites where the format arguments are expensive to evaluate:
+//
+//	if flog.Enabled(flog.Debug) {
+//	    flog.Debugf("...", expensiveCall(), ...)
+//	}
+//
+// For cheap-argument calls there's no need to gate; logf already returns
+// fast when the level is below threshold.
+func Enabled(level Level) bool {
+	m := Level(minLevel.Load())
+	return m != None && level >= m
+}
+
+// DebugEnabled is a shortcut for Enabled(Debug). Cheaper to call than
+// constructing the Level value at every gate site.
+func DebugEnabled() bool { return Enabled(Debug) }
+
 func logf(level Level, format string, args ...any) {
-	if level < minLevel || minLevel == None {
+	m := Level(minLevel.Load())
+	if level < m || m == None {
 		return
 	}
 
