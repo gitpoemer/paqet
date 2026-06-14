@@ -13,6 +13,92 @@ paqet's own design becomes the bottleneck — at that scale, horizontal
 scale-out (multiple paqet backends behind an L4 load balancer with
 IP-hash) is the recommended path.
 
+---
+
+## Quick start — copy-paste everything
+
+Adjust the paths in the systemd unit if your binary or config live
+somewhere other than `/usr/local/bin/paqet` and `/etc/paqet/config.yaml`.
+Then run the block as root.
+
+```bash
+# 1) Persist sysctl tuning.
+sudo tee /etc/sysctl.d/99-paqet.conf > /dev/null <<'EOF'
+# paqet — file descriptors
+fs.file-max = 2097152
+fs.nr_open = 1048576
+
+# paqet — socket buffers (32 MB max, 8 MB default)
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 8388608
+net.core.wmem_default = 8388608
+net.core.netdev_max_backlog = 50000
+
+# paqet — listen / SYN backlog
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# paqet — outbound TCP behavior (server → target hosts)
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 10000 65535
+EOF
+sudo sysctl --system
+
+# 2) Install the systemd unit. Adjust ExecStart / config path if needed.
+sudo tee /etc/systemd/system/paqet.service > /dev/null <<'EOF'
+[Unit]
+Description=paqet server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/paqet run -c /etc/paqet/config.yaml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+LimitNPROC=infinity
+
+# Capabilities for raw packet I/O without running as full root.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# Optional: GC pressure under high RAM use.
+# paqet sets GOMEMLIMIT itself at startup (90% of cgroup/host RAM).
+# Override only if you want a specific ceiling:
+#Environment=GOMEMLIMIT=8GiB
+# Optional CPU pinning — leave CPU 0-1 for the kernel:
+#CPUAffinity=2-7
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 3) Reload, enable, start.
+sudo systemctl daemon-reload
+sudo systemctl enable --now paqet.service
+
+# 4) Verify the process inherited the limits.
+sleep 1
+PID=$(pidof paqet) && {
+  echo "FDs:       $(ls /proc/$PID/fd | wc -l)"
+  echo "RSS:       $(awk '/VmRSS/ {print $2 " " $3}' /proc/$PID/status)"
+  echo "NOFILE:    $(grep 'open files' /proc/$PID/limits)"
+  echo "Sockets:   $(ss -tn state established | wc -l)"
+}
+```
+
+Done. paqet is running with raised FD limits and tuned sysctls,
+persisted across reboots. The rest of this document explains what
+each knob does and when to tune it further.
+
+---
+
 ## File descriptors
 
 Each tunneled outbound TCP or UDP connection holds one file
@@ -20,27 +106,9 @@ descriptor. Default Linux per-process limit is 1024 (or whatever the
 distro's systemd ships); paqet will fail with `accept: too many open
 files` long before saturation.
 
-### Per-process limit
-
-For a systemd unit:
-```
-[Service]
-LimitNOFILE=1048576
-```
-
-For a shell test:
-```
-ulimit -n 1048576
-```
-
-### System-wide ceiling
-
-```
-sudo sysctl -w fs.file-max=2097152
-sudo sysctl -w fs.nr_open=1048576
-```
-
-Persist in `/etc/sysctl.d/99-paqet.conf`.
+The quick-start block sets:
+- `LimitNOFILE=1048576` in the systemd unit (per-process)
+- `fs.file-max=2097152` and `fs.nr_open=1048576` via sysctl (system-wide)
 
 ## Socket buffers
 
@@ -49,13 +117,9 @@ modern kernels. Smux's per-stream and session-wide buffers benefit
 from larger socket buffers, particularly under bursty UDP and high-
 latency paths.
 
-```
-sudo sysctl -w net.core.rmem_max=33554432       # 32 MB
-sudo sysctl -w net.core.wmem_max=33554432
-sudo sysctl -w net.core.rmem_default=8388608    # 8 MB
-sudo sysctl -w net.core.wmem_default=8388608
-sudo sysctl -w net.core.netdev_max_backlog=50000
-```
+- `rmem_max` / `wmem_max` = **32 MB** (cap any socket can request)
+- `rmem_default` / `wmem_default` = **8 MB** (default per socket)
+- `netdev_max_backlog` = **50000** (kernel ingress queue)
 
 ## Connection backlog
 
@@ -63,37 +127,37 @@ The kernel's listen-queue limit caps how many half-open SOCKS5
 connections can be pending. Default 4096 is fine for thousands of
 users but bump it if you see `ss -ltn Send-Q` saturating.
 
-```
-sudo sysctl -w net.core.somaxconn=65535
-sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
-```
+Quick-start sets `somaxconn` and `tcp_max_syn_backlog` to 65535.
 
 ## TCP behavior tuning
 
-Outbound TCP from paqet to target hosts. We already set SO_KEEPALIVE
-with 30s period (alpha.33), but the kernel-wide tunables affect every
-connection.
+paqet already sets `SO_KEEPALIVE` with a 30s period on outbound dials
+(alpha.33), but kernel-wide tunables apply to every connection
+including new ones the keepalive code hasn't customized:
 
-```
-sudo sysctl -w net.ipv4.tcp_keepalive_time=120         # idle before probes (s)
-sudo sysctl -w net.ipv4.tcp_keepalive_intvl=10         # interval between probes (s)
-sudo sysctl -w net.ipv4.tcp_keepalive_probes=6         # probes before declaring dead
-sudo sysctl -w net.ipv4.tcp_fin_timeout=15             # FIN_WAIT2 timeout
-sudo sysctl -w net.ipv4.tcp_tw_reuse=1                 # safe in NAT-free server scenarios
-sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"
-```
+- `tcp_keepalive_time=120` — idle seconds before probes
+- `tcp_keepalive_intvl=10` — interval between probes
+- `tcp_keepalive_probes=6` — declare dead after 6 failed probes
+  → total detect time ≈ 120 + 6 × 10 = **180 s** for connections that
+  paqet's per-socket keepalive doesn't override
+- `tcp_fin_timeout=15` — shrinks FIN_WAIT2 retention
+- `tcp_tw_reuse=1` — recycles TIME_WAIT for outbound (safe; not NAT)
+- `ip_local_port_range=10000 65535` — gives ~55k outbound source ports
 
-## pcap (BPF) buffer
+## pcap (BPF) ring buffer
 
 paqet reads packets via libpcap; the kernel ring buffer behind it
 defaults to small. Higher = fewer packet drops under burst load. Set
 on the interface:
 
-```
+```bash
 sudo ethtool -G eth0 rx 4096 tx 4096    # if NIC supports it
 ```
 
-If you see `pcap_stats` reporting `drops` > 0 under load, the ring
+Make persistent via your distro's network config (NetworkManager,
+networkd, ifupdown, or a `udev` rule).
+
+If you see `pcap_stats` reporting `drops > 0` under load, the ring
 buffer is the bottleneck.
 
 ## CPU & GC
@@ -101,60 +165,31 @@ buffer is the bottleneck.
 paqet is largely single-pcap-thread bound on the receive side; the
 hot CPU at saturation is the pcap parse + KCP dispatch path. Pin
 that goroutine to a dedicated CPU and isolate it from interrupt
-handlers:
+handlers (uncomment `CPUAffinity` in the unit):
 
-```
-sudo systemctl set-property paqet-server.service CPUAffinity=2-7
+```ini
+CPUAffinity=2-7
 ```
 
-(adjust core list to your topology — leave CPU 0–1 for syscalls/IRQs.)
+Adjust the core list to your topology — leave CPU 0–1 for syscalls/
+IRQs. After editing the unit run `systemctl daemon-reload && systemctl
+restart paqet`.
 
 paqet sets `GOMEMLIMIT` automatically to 90% of cgroup-or-host RAM at
-startup (alpha.33). Override via the env var if a manual target is
-needed:
+startup. Override via the env var if a manual target is needed:
 
-```
-[Service]
+```ini
 Environment=GOMEMLIMIT=8GiB
 ```
 
 ## Verify the tuning
 
-After applying:
-
-```
-ulimit -n                                                # should report your new soft limit
-sysctl net.core.somaxconn fs.file-max                    # confirm reads back
-ss -ltn                                                  # see your listening sockets
-cat /proc/$(pidof paqet)/limits | grep open              # confirm the process sees the limit
-```
-
-## systemd-unit template (Linux server)
-
-```ini
-[Unit]
-Description=paqet server
-After=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/paqet -c /etc/paqet/config.yaml run
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
-LimitNPROC=infinity
-Environment=GOGC=200
-# Optional pinning — adjust to your CPU layout:
-# CPUAffinity=2-7
-# Optional explicit memory ceiling:
-# Environment=GOMEMLIMIT=8GiB
-
-# Capabilities for raw socket / pcap (alternative to running as root):
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
+```bash
+ulimit -n                                              # your shell's limit
+sysctl net.core.somaxconn fs.file-max                  # confirm sysctl values
+ss -ltn                                                # listening sockets
+cat /proc/$(pidof paqet)/limits | grep "open files"    # process limits
+ss -tn state established | wc -l                       # live sockets count
 ```
 
 ## Horizontal scaling (>10k users)
