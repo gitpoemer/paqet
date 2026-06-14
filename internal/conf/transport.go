@@ -10,7 +10,12 @@ type Transport struct {
 	Conn     int    `yaml:"conn"`
 	TCPBuf   int    `yaml:"tcpbuf"`
 	UDPBuf   int    `yaml:"udpbuf"`
-	KCP      *KCP   `yaml:"kcp"`
+	// UDPIdleTimeoutMS is the both-direction-quiet timeout in
+	// milliseconds before a UDP relay stream is torn down. 0 ⇒
+	// use buffer.DefaultUDPIdleTimeout (30s). Lower for DNS-heavy
+	// deployments, higher for sticky long-lived UDP (QUIC, MTProto).
+	UDPIdleTimeoutMS int  `yaml:"udpidletimeout"`
+	KCP              *KCP `yaml:"kcp"`
 }
 
 func (t *Transport) setDefaults(role string) {
@@ -29,6 +34,11 @@ func (t *Transport) setDefaults(role string) {
 	}
 	if t.UDPBuf < 2*1024 {
 		t.UDPBuf = 2 * 1024
+	}
+	// UDPIdleTimeoutMS=0 keeps the buffer-package default; only
+	// validate ranges if the user explicitly set something.
+	if t.UDPIdleTimeoutMS != 0 && t.UDPIdleTimeoutMS < 500 {
+		t.UDPIdleTimeoutMS = 500
 	}
 
 	switch t.Protocol {

@@ -10,6 +10,7 @@ import (
 	"paqet/internal/forward"
 	"paqet/internal/socks"
 	"syscall"
+	"time"
 )
 
 func startClient(cfg *conf.Conf) {
@@ -36,6 +37,9 @@ func startClient(cfg *conf.Conf) {
 		s, err := socks.New(client)
 		if err != nil {
 			flog.Fatalf("Failed to initialize SOCKS5: %v", err)
+		}
+		if ms := cfg.Transport.UDPIdleTimeoutMS; ms > 0 {
+			s.SetUDPIdleTimeout(time.Duration(ms) * time.Millisecond)
 		}
 		if err := s.Start(ctx, ss); err != nil {
 			flog.Fatalf("SOCKS5 encountered an error: %v", err)

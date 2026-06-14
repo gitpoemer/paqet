@@ -43,10 +43,11 @@ func (h *Handler) HandleUDPAssociate(ctx context.Context, udp *net.UDPConn, clie
 	// targets from the same client port multiplex without contention.
 	// Reader goroutines for each stream share this map for cleanup.
 	streams := &udpStreamSet{
-		client:     h.client,
-		udp:        udp,
-		clientAddr: nil, // first datagram fixes this
-		entries:    make(map[string]*udpStreamEntry),
+		client:      h.client,
+		udp:         udp,
+		clientAddr:  nil, // first datagram fixes this
+		entries:     make(map[string]*udpStreamEntry),
+		idleTimeout: h.udpIdleTimeout,
 	}
 	defer streams.closeAll()
 
@@ -137,11 +138,21 @@ type udpStreamEntry struct {
 }
 
 type udpStreamSet struct {
-	mu         sync.Mutex
-	client     udpClient
-	udp        *net.UDPConn
-	clientAddr *net.UDPAddr
-	entries    map[string]*udpStreamEntry
+	mu          sync.Mutex
+	client      udpClient
+	udp         *net.UDPConn
+	clientAddr  *net.UDPAddr
+	entries     map[string]*udpStreamEntry
+	idleTimeout time.Duration // 0 ⇒ use buffer.DefaultUDPIdleTimeout
+}
+
+// effectiveIdle returns the configured idle timeout, falling back to
+// the package default.
+func (s *udpStreamSet) effectiveIdle() time.Duration {
+	if s.idleTimeout > 0 {
+		return s.idleTimeout
+	}
+	return buffer.DefaultUDPIdleTimeout
 }
 
 func (s *udpStreamSet) getOrCreate(src *net.UDPAddr, target string, dest AddrSpec) (*udpStreamEntry, bool, error) {
@@ -181,8 +192,9 @@ func (s *udpStreamSet) readerLoop(e *udpStreamEntry) {
 
 	buf := make([]byte, buffer.UPool)
 	scratch := make([]byte, 0, 64) // for the SOCKS5 UDP header
+	idle := s.effectiveIdle()
 	for {
-		_ = e.strm.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_ = e.strm.SetReadDeadline(time.Now().Add(idle))
 		n, err := e.strm.Read(buf)
 		_ = e.strm.SetReadDeadline(time.Time{})
 		if err != nil {

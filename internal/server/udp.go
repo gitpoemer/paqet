@@ -37,7 +37,11 @@ func (s *Server) handleUDP(ctx context.Context, strm tnet.Strm, addr string) err
 	// ~113 minutes uptime; cumulative buffer pressure eventually
 	// stalled smux entirely and blocked new stream opens at the
 	// client. See OPTIMIZE_NOTES.md (alpha.31 root-cause).
-	inlineErr, bgErr := buffer.RelayUDPBidi(strm, conn, buffer.DefaultUDPIdleTimeout)
+	idleTimeout := buffer.DefaultUDPIdleTimeout
+	if ms := s.cfg.Transport.UDPIdleTimeoutMS; ms > 0 {
+		idleTimeout = time.Duration(ms) * time.Millisecond
+	}
+	inlineErr, bgErr := buffer.RelayUDPBidi(strm, conn, idleTimeout)
 
 	if ctx.Err() != nil {
 		return nil

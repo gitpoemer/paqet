@@ -15,12 +15,26 @@ type UDPEndpoint interface {
 }
 
 // DefaultUDPIdleTimeout is the default both-direction-quiet timeout
-// for UDP relays. 60s comfortably covers DNS-over-UDP (sub-second
-// round trips), QUIC handshakes (a few hundred ms), and typical
-// gaming / RTC heartbeats. Long-lived sessions (QUIC, MTProto) keep
-// the relay alive because their keepalive traffic refreshes the
-// deadline on each Read.
-const DefaultUDPIdleTimeout = 60 * time.Second
+// for UDP relays.
+//
+// 30s is below typical consumer-NAT UDP timeout (30-60s), which is
+// the de-facto ceiling for any UDP service that wants to stay alive
+// across home routers. Every protocol designed to traverse NAT
+// pings well under that ceiling:
+//   - WireGuard keepalive: 25s
+//   - QUIC PING / ack-eliciting: 15-20s in idle
+//   - WebRTC STUN keepalive: 5-15s
+//   - MTProto (Telegram) on active sessions: well under 30s
+//
+// So 30s never kills an alive session, while being short enough
+// that single-shot UDP (DNS, NTP, traceroute, "1 query then dead")
+// frees its per-stream smux buffer fast. At 142 streams/sec arrival
+// rate this caps zombie buffer pressure at ~270 MB (half of 60s).
+//
+// Override via conf.Transport.UDPIdleTimeout when the deployment is
+// dominated by either short queries (lower) or sticky sessions
+// (higher).
+const DefaultUDPIdleTimeout = 30 * time.Second
 
 // RelayUDPBidi runs a bidirectional UDP relay between strm and conn.
 // Returns when either side errors OR neither side has read any byte
