@@ -28,27 +28,7 @@ func (s *Server) handleTCP(ctx context.Context, strm tnet.Strm, addr string) err
 	}()
 	flog.Debugf("TCP connection established to %s for stream %d", addr, strm.SID())
 
-	// Bidi copy. When EITHER direction finishes, close the OTHER
-	// side's source so the still-blocked Read unblocks immediately.
-	//
-	// The previous version only closed conn after the inline direction
-	// returned — if the BG direction (target → tunnel) returned first
-	// (target server EOF'd faster than the tunnel-side data flow),
-	// inline's strm.Read sat blocked until the upstream peer eventually
-	// closed the stream, leaking goroutines and smux stream-buffer
-	// memory per stuck stream. See OPTIMIZE_NOTES.md (alpha.27 fix).
-	//
-	// Both Close calls are idempotent — handleConn's outer defer also
-	// calls strm.Close, and the function-exit defer also closes conn.
-	errCh := make(chan error, 1)
-	go func() {
-		err := buffer.CopyT(conn, strm)
-		strm.Close()
-		errCh <- err
-	}()
-	inlineErr := buffer.CopyT(strm, conn)
-	_ = conn.Close()
-	bgErr := <-errCh
+	inlineErr, bgErr := buffer.RelayBidi(conn, strm)
 
 	// Surface the most informative error: ctx-cancel takes priority,
 	// then the inline direction (covers TCP-from-tunnel-to-target),

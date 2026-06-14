@@ -55,21 +55,7 @@ func (f *Forward) handleTCPConn(ctx context.Context, conn net.Conn) error {
 	}()
 	flog.Infof("accepted TCP connection %s -> %s", conn.RemoteAddr(), f.targetAddr)
 
-	// Bidi copy. When EITHER direction finishes, close the OTHER
-	// side's source so the still-blocked Read unblocks immediately.
-	// See OPTIMIZE_NOTES.md (alpha.27 fix) — same race as the SOCKS5
-	// and server-side relays: the previous version only closed conn
-	// after the inline direction returned, so a BG-exits-first stream
-	// stayed pinned until the smux peer happened to close.
-	errCh := make(chan error, 1)
-	go func() {
-		err := buffer.CopyT(conn, strm)
-		strm.Close()
-		errCh <- err
-	}()
-	inlineErr := buffer.CopyT(strm, conn)
-	_ = conn.Close()
-	bgErr := <-errCh
+	inlineErr, bgErr := buffer.RelayBidi(conn, strm)
 
 	if ctx.Err() != nil {
 		return nil
