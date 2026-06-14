@@ -57,10 +57,24 @@ func (h *Handler) handleTCPConnect(conn *net.TCPConn, r *socks5.Request) error {
 	defer strm.Close()
 	flog.Debugf("SOCKS5 stream %d created for %s -> %s", strm.SID(), conn.RemoteAddr(), r.Address())
 
-	// Single-goroutine bidi copy. See plan #4.
+	// Bidi copy. When EITHER direction finishes, close the OTHER
+	// side's source so the still-blocked Read unblocks immediately.
+	//
+	// Without this, the common case of "local app closes conn after a
+	// short request" left the inline goroutine stuck on strm.Read for
+	// as long as the SERVER took to wind down its own bidi-copy and
+	// close the smux stream — easily tens of seconds per stream. At a
+	// busy SOCKS5 traffic rate this accumulates into thousands of
+	// stuck CopyT goroutines and FDs, eventually exhausting smux
+	// stream-buffer memory. See OPTIMIZE_NOTES.md (alpha.27 fix).
+	//
+	// Both Close calls are idempotent — outer defer also calls
+	// strm.Close, and conn.Close is no-op after the first call.
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- buffer.CopyT(conn, strm)
+		err := buffer.CopyT(conn, strm)
+		strm.Close()
+		errCh <- err
 	}()
 	inlineErr := buffer.CopyT(strm, conn)
 	_ = conn.Close()
