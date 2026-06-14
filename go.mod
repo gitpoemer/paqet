@@ -7,7 +7,7 @@ require (
 	github.com/gopacket/gopacket v1.6.1
 	github.com/spf13/cobra v1.10.2
 	github.com/xtaci/kcp-go/v5 v5.6.72
-	github.com/xtaci/smux v1.5.53
+	github.com/xtaci/smux v1.5.57
 	golang.org/x/crypto v0.50.0
 	golang.org/x/net v0.52.0
 )
@@ -22,3 +22,5 @@ require (
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 )
+
+replace github.com/xtaci/smux => ./third_party/smux
