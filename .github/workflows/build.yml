@@ -66,6 +66,9 @@ jobs:
                   git clone --depth 1 --branch ${GITHUB_REF#refs/tags/} https://github.com/${{ github.repository }} . 2>/dev/null || \
                   git clone https://github.com/${{ github.repository }} .
                   git checkout ${{ github.sha }}
+                  # Fetch submodules (third_party/smux is needed for the
+                  # local replace in go.mod since alpha.34 item 10).
+                  git submodule update --init --recursive
 
             - name: Build Static libpcap
               run: |
@@ -195,6 +198,8 @@ jobs:
 
             - name: Checkout Code
               uses: actions/checkout@v6
+              with:
+                  submodules: recursive
 
             - name: Setup Go
               uses: actions/setup-go@v6
@@ -256,6 +261,8 @@ jobs:
         steps:
             - name: Checkout Code
               uses: actions/checkout@v6
+              with:
+                  submodules: recursive
 
             - name: Setup Go
               uses: actions/setup-go@v6
