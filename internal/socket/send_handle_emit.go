@@ -37,6 +37,12 @@ type packetFields struct {
 	ack     uint32
 	tsVal   uint32
 	tsEcr   uint32 // 0 on SYN
+	// ipID is the 16-bit IPv4 Identification value. Real stacks pick
+	// varying values (per-packet or per-flow); always emitting 0 (the
+	// alpha.23 behavior, matching gopacket's default) is a clean
+	// fingerprint. Set in nextPacketFields via a hash of the per-handle
+	// counter. Ignored for IPv6.
+	ipID uint16
 }
 
 // Wire constants. Match the values gopacket emits for the equivalent
@@ -147,7 +153,7 @@ func (h *SendHandle) serializeIPv4(scratch, payload []byte, pf packetFields) int
 	ip[0] = 0x45                                       // Version (4) + IHL (5 words = 20 bytes)
 	ip[1] = ipTOS_TC                                   // DSCP/ECN
 	binary.BigEndian.PutUint16(ip[2:4], uint16(ipTotal)) // TotalLength
-	binary.BigEndian.PutUint16(ip[4:6], 0)             // Identification: 0 (gopacket default)
+	binary.BigEndian.PutUint16(ip[4:6], pf.ipID)         // Identification (varies per packet)
 	binary.BigEndian.PutUint16(ip[6:8], 0x4000)        // Flags=DF, FragmentOffset=0
 	ip[8] = ipTTL                                      // TTL
 	ip[9] = ipProtoTCP                                 // Protocol

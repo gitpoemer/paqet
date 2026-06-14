@@ -104,7 +104,7 @@ func TestParseInboundEquivalence(t *testing.T) {
 				frame := buildSyntheticFrame(t, h, payload, pf)
 
 				wantIP, wantPort, wantPayload, wantOK := gopacketParse(frame)
-				gotIP, gotPort, gotPayload, gotOK := parseInbound(frame)
+				gotIP, gotPort, _, gotPayload, gotOK := parseInbound(frame)
 
 				if wantOK != gotOK {
 					t.Fatalf("ok mismatch: gopacket=%v handrolled=%v (flags=%+v dstIP=%v plen=%d)", wantOK, gotOK, flags, dstIP, pl)
@@ -150,7 +150,7 @@ func TestParseInboundRuntFrames(t *testing.T) {
 		make([]byte, 14 + ipv4HdrSize + 10), // eth + ipv4 + half TCP
 	}
 	for i, c := range cases {
-		_, _, _, ok := parseInbound(c)
+		_, _, _, _, ok := parseInbound(c)
 		if ok {
 			t.Fatalf("case %d (%d bytes) wrongly accepted", i, len(c))
 		}
@@ -168,7 +168,7 @@ func TestParseInboundDeclaredOverrun(t *testing.T) {
 	// Corrupt the IPv4 TotalLength field to claim more bytes than we have.
 	frame[ethHdrSize+2] = 0xFF
 	frame[ethHdrSize+3] = 0xFF
-	if _, _, _, ok := parseInbound(frame); ok {
+	if _, _, _, _, ok := parseInbound(frame); ok {
 		t.Fatal("declared overrun was wrongly accepted")
 	}
 }
@@ -182,7 +182,7 @@ func TestParseInboundNonTCP(t *testing.T) {
 	}
 	frame := buildSyntheticFrame(t, h, make([]byte, 64), pf)
 	frame[ethHdrSize+9] = 17 // UDP
-	if _, _, _, ok := parseInbound(frame); ok {
+	if _, _, _, _, ok := parseInbound(frame); ok {
 		t.Fatal("non-TCP protocol was wrongly accepted")
 	}
 }
@@ -219,7 +219,7 @@ func BenchmarkParseInbound_Handrolled_1400(b *testing.B) {
 	frame := buildSyntheticFrame(b, h, payload, pf)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _, _ = parseInbound(frame)
+		_, _, _, _, _ = parseInbound(frame)
 	}
 }
 
@@ -249,6 +249,6 @@ func BenchmarkParseInbound_Handrolled_64(b *testing.B) {
 	frame := buildSyntheticFrame(b, h, payload, pf)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _, _ = parseInbound(frame)
+		_, _, _, _, _ = parseInbound(frame)
 	}
 }

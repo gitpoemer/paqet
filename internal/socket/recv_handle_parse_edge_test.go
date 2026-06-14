@@ -166,7 +166,7 @@ func TestParseInbound_IPv4_WithOptions(t *testing.T) {
 	}
 	frame := rf.build()
 
-	gotIP, gotPort, gotPayload, ok := parseInbound(frame)
+	gotIP, gotPort, _, gotPayload, ok := parseInbound(frame)
 	if !ok {
 		t.Fatal("rejected unexpectedly")
 	}
@@ -198,7 +198,7 @@ func TestParseInbound_IPv4_MaxOptions(t *testing.T) {
 		payload:    payload,
 	}
 	frame := rf.build()
-	_, port, p, ok := parseInbound(frame)
+	_, port, _, p, ok := parseInbound(frame)
 	if !ok || port != 1234 || string(p) != "ok" {
 		t.Fatalf("ok=%v port=%d payload=%q", ok, port, string(p))
 	}
@@ -220,7 +220,7 @@ func TestParseInbound_IPv4_NonZeroFragOffset(t *testing.T) {
 		tcpDstPort: 80,
 		payload:    make([]byte, 64),
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("non-zero fragment offset wrongly accepted")
 	}
 }
@@ -240,7 +240,7 @@ func TestParseInbound_IPv4_MoreFragmentsFlag(t *testing.T) {
 		tcpDstPort: 80,
 		payload:    make([]byte, 64),
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("MF=1 wrongly accepted")
 	}
 }
@@ -258,7 +258,7 @@ func TestParseInbound_IPv4_ReservedFlagSet(t *testing.T) {
 		tcpDstPort: 80,
 		payload:    make([]byte, 64),
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("reserved flag wrongly accepted")
 	}
 }
@@ -276,7 +276,7 @@ func TestParseInbound_IPv4_NoFlagsClean(t *testing.T) {
 		tcpDstPort: 80,
 		payload:    []byte("ok"),
 	}
-	if _, _, p, ok := parseInbound(rf.build()); !ok || string(p) != "ok" {
+	if _, _, _, p, ok := parseInbound(rf.build()); !ok || string(p) != "ok" {
 		t.Fatalf("clean no-DF wrongly rejected: ok=%v p=%q", ok, p)
 	}
 }
@@ -289,7 +289,7 @@ func TestParseInbound_VLAN_Rejected(t *testing.T) {
 	// the next packet).
 	rf := &rawFrame{ethType: 0x8100, v4SrcIP: ipv4(1, 2, 3, 4), payload: []byte("x")}
 	frame := rf.build()
-	if _, _, _, ok := parseInbound(frame); ok {
+	if _, _, _, _, ok := parseInbound(frame); ok {
 		t.Fatal("VLAN frame wrongly accepted")
 	}
 }
@@ -297,14 +297,14 @@ func TestParseInbound_VLAN_Rejected(t *testing.T) {
 func TestParseInbound_QinQ_Rejected(t *testing.T) {
 	// 0x88a8 is the ethType for stacked / QinQ VLAN. Same handling.
 	rf := &rawFrame{ethType: 0x88a8, v4SrcIP: ipv4(1, 2, 3, 4), payload: []byte("x")}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("QinQ frame wrongly accepted")
 	}
 }
 
 func TestParseInbound_ARP_Rejected(t *testing.T) {
 	rf := &rawFrame{ethType: 0x0806, payload: []byte("arp")}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("ARP frame wrongly accepted")
 	}
 }
@@ -323,7 +323,7 @@ func TestParseInbound_IPv6_HopByHop_Rejected(t *testing.T) {
 		tcpSrcPort:   80, tcpDstPort: 80,
 		payload: []byte("x"),
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("Hop-by-Hop next-header wrongly accepted")
 	}
 }
@@ -336,7 +336,7 @@ func TestParseInbound_IPv6_RoutingHeader_Rejected(t *testing.T) {
 		tcpSrcPort: 80, tcpDstPort: 80,
 		payload: []byte("x"),
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("Routing extension header wrongly accepted")
 	}
 }
@@ -350,7 +350,7 @@ func TestParseInbound_IPv6_FragmentHeader_Rejected(t *testing.T) {
 		tcpSrcPort: 80, tcpDstPort: 80,
 		payload: []byte("x"),
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("IPv6 Fragment extension header wrongly accepted")
 	}
 }
@@ -371,7 +371,7 @@ func TestParseInbound_TCP_MaxDataOffset(t *testing.T) {
 		tcpOpts:    make([]byte, 40), // 40 bytes of options
 		payload:    []byte("late"),
 	}
-	_, port, p, ok := parseInbound(rf.build())
+	_, port, _, p, ok := parseInbound(rf.build())
 	if !ok || port != 12345 || string(p) != "late" {
 		t.Fatalf("max-dataOff parse failed: ok=%v port=%d p=%q", ok, port, p)
 	}
@@ -393,7 +393,7 @@ func TestParseInbound_TCP_DataOffTooSmall(t *testing.T) {
 	// we get a 16-byte short TCP, which itself is below tcpHdrSize. The
 	// parser should reject either at the dataOff<5 check or at the
 	// short-header check — both are valid.
-	if _, _, _, ok := parseInbound(frame); ok {
+	if _, _, _, _, ok := parseInbound(frame); ok {
 		t.Fatal("dataOff<5 wrongly accepted")
 	}
 }
@@ -412,7 +412,7 @@ func TestParseInbound_TCP_DataOffPastDeclaredLength(t *testing.T) {
 		tcpDataOff: 10, // claims 40 bytes of TCP header
 		tcpOpts:    make([]byte, 20),
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("dataOff overrun wrongly accepted")
 	}
 }
@@ -429,7 +429,7 @@ func TestParseInbound_IPv4_TotalLenSmallerThanHeader(t *testing.T) {
 		v4DstIP:    ipv4(10, 0, 0, 2),
 		tcpSrcPort: 80, tcpDstPort: 80,
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("totalLen < ipHdrLen wrongly accepted")
 	}
 }
@@ -446,7 +446,7 @@ func TestParseInbound_IPv4_TotalLenZero(t *testing.T) {
 		payload: make([]byte, 100),
 	}
 	// IP claims 65535 bytes total but the buffer is much smaller. Reject.
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("oversized totalLen wrongly accepted")
 	}
 }
@@ -471,7 +471,7 @@ func TestParseInbound_IPv4_JumboFrame(t *testing.T) {
 		tcpSrcPort: 80, tcpDstPort: 80,
 		payload: payload,
 	}
-	_, _, p, ok := parseInbound(rf.build())
+	_, _, _, p, ok := parseInbound(rf.build())
 	if !ok {
 		t.Fatal("jumbo frame wrongly rejected")
 	}
@@ -493,7 +493,7 @@ func TestParseInbound_IPv6_JumboFrame(t *testing.T) {
 		tcpSrcPort: 80, tcpDstPort: 80,
 		payload: payload,
 	}
-	_, _, p, ok := parseInbound(rf.build())
+	_, _, _, p, ok := parseInbound(rf.build())
 	if !ok || len(p) != 9000 {
 		t.Fatalf("IPv6 jumbo: ok=%v len=%d", ok, len(p))
 	}
@@ -518,7 +518,7 @@ func TestParseInbound_EthernetPaddingTrailer(t *testing.T) {
 		ethPad:  20, // 20 bytes of zero padding after the IP body
 	}
 	frame := rf.build()
-	_, _, p, ok := parseInbound(frame)
+	_, _, _, p, ok := parseInbound(frame)
 	if !ok {
 		t.Fatal("padded frame wrongly rejected")
 	}
@@ -539,7 +539,7 @@ func TestParseInbound_IPv4_UDPRejected(t *testing.T) {
 		v4DstIP:    ipv4(10, 0, 0, 2),
 		tcpSrcPort: 80, tcpDstPort: 80, // UDP-as-TCP payload, parser shouldn't reach
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("UDP protocol wrongly accepted")
 	}
 }
@@ -554,7 +554,7 @@ func TestParseInbound_IPv4_ICMPRejected(t *testing.T) {
 		v4DstIP:    ipv4(10, 0, 0, 2),
 		tcpSrcPort: 80, tcpDstPort: 80,
 	}
-	if _, _, _, ok := parseInbound(rf.build()); ok {
+	if _, _, _, _, ok := parseInbound(rf.build()); ok {
 		t.Fatal("ICMP protocol wrongly accepted")
 	}
 }
@@ -573,7 +573,7 @@ func TestParseInbound_IPv4_WrongVersion(t *testing.T) {
 	frame := rf.build()
 	// Corrupt the IP version: byte after ethernet[12:14], byte[0] high nibble.
 	frame[ethHdrSize] = 0x55 // version=5, IHL=5
-	if _, _, _, ok := parseInbound(frame); ok {
+	if _, _, _, _, ok := parseInbound(frame); ok {
 		t.Fatal("IP version=5 wrongly accepted")
 	}
 }
@@ -585,7 +585,7 @@ func TestParseInbound_IPv6_WrongVersion(t *testing.T) {
 	}
 	frame := rf.build()
 	frame[ethHdrSize] = 0x80 // version=8
-	if _, _, _, ok := parseInbound(frame); ok {
+	if _, _, _, _, ok := parseInbound(frame); ok {
 		t.Fatal("IPv6 version=8 wrongly accepted")
 	}
 }

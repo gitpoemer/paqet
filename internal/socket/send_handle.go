@@ -66,6 +66,18 @@ type SendHandle struct {
 	// Hand-rolled emitter (send_handle_emit.go) writes into the pooled
 	// slice directly; pcap.WritePacketData copies it before returning.
 	scratchPool sync.Pool
+	// peerTS maps hash.IPAddr(peerIP, peerPort) → *atomic.Uint32 holding
+	// the most recently observed peer TCP-timestamp value (option kind=8).
+	// nextPacketFields uses it to emit tsEcr that actually echoes the
+	// peer, so a DPI tracking timestamp coherence sees real TCP semantics
+	// instead of the synthetic tsEcr := tsVal - (counter%200 + 50)
+	// formula. recv_handle.Read writes into it after parseInbound.
+	//
+	// sync.Map is the right shape here: keys are added once per peer
+	// (LoadOrStore on first sight), then both readers (send) and writers
+	// (recv) hit the existing *atomic.Uint32 lock-free. No fast-path
+	// mutex contention.
+	peerTS sync.Map
 }
 
 func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
@@ -150,6 +162,11 @@ func (h *SendHandle) nextPacketFields(dstIP net.IP, dstPort uint16) packetFields
 		dstPort: dstPort,
 		flags:   f,
 		tsVal:   tsVal,
+		// Mint a varying 16-bit IP Identification from the counter via
+		// Knuth's multiplicative hash. Cheap (one mul + one shift), no
+		// extra atomic. Looks uniform to a wire observer — no clean
+		// "Identification=0 in 100% of frames" fingerprint.
+		ipID: uint16((counter * 0x9E3779B9) >> 16),
 	}
 	if f.SYN {
 		pf.seq = 1 + (counter & 0x7)
@@ -158,12 +175,54 @@ func (h *SendHandle) nextPacketFields(dstIP net.IP, dstPort uint16) packetFields
 		}
 		pf.tsEcr = 0
 	} else {
-		pf.tsEcr = tsVal - (counter%200 + 50)
+		// Echo the most recently observed peer timestamp if recv has
+		// seen one for this flow. Falls back to a synthetic value when
+		// we haven't yet received any timestamped segment from this
+		// peer (first reply during handshake, or a peer that doesn't
+		// negotiate timestamps). The fallback still varies per packet
+		// so it doesn't itself fingerprint as "tsEcr=0 always".
+		if v := h.loadPeerTSVal(dstIP, dstPort); v != 0 {
+			pf.tsEcr = v
+		} else {
+			pf.tsEcr = tsVal - (counter%200 + 50)
+		}
 		seq := h.time + (counter << 7)
 		pf.seq = seq
 		pf.ack = seq - (counter & 0x3FF) + 1400
 	}
 	return pf
+}
+
+// loadPeerTSVal returns the most recently observed peer TCP-timestamp
+// value for the given flow, or 0 if unseen.
+func (h *SendHandle) loadPeerTSVal(peerIP net.IP, peerPort uint16) uint32 {
+	key := hash.IPAddr(peerIP, peerPort)
+	if v, ok := h.peerTS.Load(key); ok {
+		return v.(*atomic.Uint32).Load()
+	}
+	return 0
+}
+
+// recordPeerTSVal stores the most recently observed peer TCP-timestamp
+// value for the given flow. recv_handle.Read calls it after parseInbound.
+// Lock-free in the steady state: only the first sight of a peer allocates
+// (LoadOrStore), every subsequent update is an atomic.Store.
+func (h *SendHandle) recordPeerTSVal(peerIP net.IP, peerPort uint16, tsVal uint32) {
+	if tsVal == 0 {
+		return // peer didn't include a timestamp option in this segment
+	}
+	key := hash.IPAddr(peerIP, peerPort)
+	if v, ok := h.peerTS.Load(key); ok {
+		v.(*atomic.Uint32).Store(tsVal)
+		return
+	}
+	slot := new(atomic.Uint32)
+	slot.Store(tsVal)
+	actual, _ := h.peerTS.LoadOrStore(key, slot)
+	if actual != slot {
+		// Lost the race; update the winner's slot.
+		actual.(*atomic.Uint32).Store(tsVal)
+	}
 }
 
 func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
@@ -205,6 +264,7 @@ func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
 			evictedKey := tail.Value.(uint64)
 			delete(h.tcpF.clientTCPF, evictedKey)
 			h.tcpF.lru.Remove(tail)
+			h.peerTS.Delete(evictedKey)
 		}
 	}
 
@@ -229,6 +289,7 @@ func (h *SendHandle) dropClientTCPF(addr net.Addr) {
 		delete(h.tcpF.clientTCPF, key)
 	}
 	h.tcpF.mu.Unlock()
+	h.peerTS.Delete(key)
 }
 
 func (h *SendHandle) Close() {

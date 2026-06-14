@@ -51,6 +51,7 @@ func gopacketEmit(h *SendHandle, payload []byte, pf packetFields) []byte {
 	if pf.dstIP.To4() != nil {
 		ip := &layers.IPv4{
 			Version: 4, IHL: 5, TOS: 184, TTL: 64,
+			Id:       pf.ipID,
 			Flags:    layers.IPv4DontFragment,
 			Protocol: layers.IPProtocolTCP,
 			SrcIP:    h.srcIPv4,
@@ -143,6 +144,7 @@ func TestSerializeEquivalence(t *testing.T) {
 					seq:     0x11223344,
 					ack:     0x55667788,
 					tsVal:   0x99AABBCC,
+					ipID:    0xABCD, // verify Identification round-trips
 				}
 				if !flags.SYN {
 					pf.tsEcr = 0xDEADBEEF

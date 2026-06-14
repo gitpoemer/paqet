@@ -40,6 +40,7 @@ func New(ctx context.Context, cfg *conf.Network) (*PacketConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create receive handle on %s: %v", cfg.Interface.Name, err)
 	}
+	recvHandle.AttachSender(sendHandle)
 
 	ctx, cancel := context.WithCancel(ctx)
 	conn := &PacketConn{
