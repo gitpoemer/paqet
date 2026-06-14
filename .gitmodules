@@ -1,4 +1,0 @@
-[submodule "third_party/smux"]
-	path = third_party/smux
-	url = https://github.com/xtaci/smux.git
-	branch = master
