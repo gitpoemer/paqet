@@ -16,16 +16,23 @@ import (
 )
 
 // clientTCPFCap bounds the per-client TCP-flag-iterator LRU. Each entry is
-// ~80 bytes (iterator + list element header + map slot) so 16k entries is
-// ~1.3 MB resident.
+// ~80 bytes (iterator + list element header + map slot) so 256k entries is
+// ~20 MB resident.
 //
-// 16k is well above the realistic count of concurrent active clients on a
-// single paqet server, but high enough that an attacker minting fresh-port
-// connections needs ~16k inserts before evicting a single legitimate
-// client — and legitimate clients with ongoing outbound traffic stay at
-// the LRU front via getClientTCPF, so the typical attacker eviction
-// targets are dormant entries, not active ones.
-const clientTCPFCap = 16384
+// Raised from 16k → 256k in alpha.33 for 30k+ user scenarios; the previous
+// 16k cap meant active clients got evicted every new connection on busy
+// servers. 256k accommodates large fleets without thrash. Sharded across
+// clientTCPFShards so the per-shard cap is clientTCPFCap/clientTCPFShards.
+const clientTCPFCap = 256 * 1024
+
+// peerTSCap bounds the peer-TCP-timestamp LRU. The recv path calls
+// recordPeerTSVal on EVERY inbound packet keyed by (srcIP, srcPort),
+// including from peers that never complete the paqet-protocol handshake
+// (random TCP probes, scanners, traffic the BPF filter lets through but
+// that's destined elsewhere). Without an explicit cap those entries leak
+// forever — small per-entry but unbounded over a long-running process.
+// Same cap as clientTCPF for matching scale assumptions.
+const peerTSCap = 256 * 1024
 
 // clientTCPFEntry is the value stored in the LRU map. `iter` is the
 // per-client flag iterator; `elem` is the entry's position in the LRU
@@ -35,16 +42,39 @@ type clientTCPFEntry struct {
 	elem *list.Element // points back to the list node holding the map key
 }
 
-type TCPF struct {
-	tcpF       iterator.Iterator[conf.TCPF]
-	clientTCPF map[uint64]*clientTCPFEntry
-	// LRU ordering: front = most recently used, back = oldest.
-	// container/list element values are the uint64 map keys.
+// clientTCPFShards is the count of shards that make up the per-client
+// TCP-flag-iterator map. Sharding splits the single hot Mutex into N
+// shards each with its own lock, so per-packet getClientTCPF lookups
+// across distinct peers contend on disjoint shards. 16 shards bounds
+// the contention reduction without bloating struct size — at 30k
+// users → ~1875 entries per shard, ~12 µs of lock time/sec/shard.
+const clientTCPFShards = 16
+
+// clientTCPFPerShardCap = ceil(clientTCPFCap / clientTCPFShards). Per
+// shard cap; total system cap is clientTCPFCap.
+const clientTCPFPerShardCap = (clientTCPFCap + clientTCPFShards - 1) / clientTCPFShards
+
+// tcpFShard is one bucket of the sharded clientTCPF map. Each shard
+// owns its mutex, map, and LRU list — independent of the others.
+type tcpFShard struct {
+	mu  sync.Mutex
+	m   map[uint64]*clientTCPFEntry
 	lru *list.List
-	// Single Mutex: both getClientTCPF (move-to-front) and
-	// setClientTCPF (insert/evict) mutate the list, so RWMutex would
-	// degrade to Lock on every call anyway.
-	mu sync.Mutex
+}
+
+type TCPF struct {
+	// tcpF is the GLOBAL iterator returned to peers that don't have a
+	// per-client entry yet. Unsharded — accessed via Next() which is
+	// internally synchronized in iterator.Iterator.
+	tcpF iterator.Iterator[conf.TCPF]
+	// shards splits the per-client lookup across clientTCPFShards
+	// independent buckets keyed by (hash mod clientTCPFShards).
+	shards [clientTCPFShards]tcpFShard
+}
+
+// shardFor returns the shard responsible for the given hash key.
+func (t *TCPF) shardFor(key uint64) *tcpFShard {
+	return &t.shards[key%clientTCPFShards]
 }
 
 type SendHandle struct {
@@ -66,18 +96,18 @@ type SendHandle struct {
 	// Hand-rolled emitter (send_handle_emit.go) writes into the pooled
 	// slice directly; pcap.WritePacketData copies it before returning.
 	scratchPool sync.Pool
-	// peerTS maps hash.IPAddr(peerIP, peerPort) → *atomic.Uint32 holding
-	// the most recently observed peer TCP-timestamp value (option kind=8).
+	// peerTS holds the most recently observed peer TCP-timestamp value
+	// per peer (option kind=8), keyed by hash.IPAddr(peerIP, peerPort).
 	// nextPacketFields uses it to emit tsEcr that actually echoes the
-	// peer, so a DPI tracking timestamp coherence sees real TCP semantics
-	// instead of the synthetic tsEcr := tsVal - (counter%200 + 50)
-	// formula. recv_handle.Read writes into it after parseInbound.
+	// peer, so a DPI tracking timestamp coherence sees real TCP
+	// semantics instead of the synthetic tsEcr formula.
 	//
-	// sync.Map is the right shape here: keys are added once per peer
-	// (LoadOrStore on first sight), then both readers (send) and writers
-	// (recv) hit the existing *atomic.Uint32 lock-free. No fast-path
-	// mutex contention.
-	peerTS sync.Map
+	// Changed from sync.Map to a bounded LRU in alpha.33 — sync.Map
+	// grew unbounded over time (every inbound packet from any peer
+	// inserted, but cleanup only fired on smux session close). Server-
+	// side BPF passes ALL inbound TCP to our port, so scanners and
+	// random probes accumulated entries forever. peerTSCap caps it.
+	peerTS *peerTSStore
 }
 
 func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
@@ -97,11 +127,14 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 		handle:  handle,
 		srcPort: uint16(cfg.Port),
 		tcpF: TCPF{
-			tcpF:       iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF},
-			clientTCPF: make(map[uint64]*clientTCPFEntry, clientTCPFCap),
-			lru:        list.New(),
+			tcpF: iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF},
 		},
-		time: uint32(time.Now().UnixNano() / int64(time.Millisecond)),
+		peerTS: newPeerTSStore(peerTSCap),
+		time:   uint32(time.Now().UnixNano() / int64(time.Millisecond)),
+	}
+	for i := range sh.tcpF.shards {
+		sh.tcpF.shards[i].m = make(map[uint64]*clientTCPFEntry, clientTCPFPerShardCap/8)
+		sh.tcpF.shards[i].lru = list.New()
 	}
 	sh.cfgInterfaceMAC = cfg.Interface.HardwareAddr
 	if cfg.IPv4.Addr != nil {
@@ -196,46 +229,29 @@ func (h *SendHandle) nextPacketFields(dstIP net.IP, dstPort uint16) packetFields
 // loadPeerTSVal returns the most recently observed peer TCP-timestamp
 // value for the given flow, or 0 if unseen.
 func (h *SendHandle) loadPeerTSVal(peerIP net.IP, peerPort uint16) uint32 {
-	key := hash.IPAddr(peerIP, peerPort)
-	if v, ok := h.peerTS.Load(key); ok {
-		return v.(*atomic.Uint32).Load()
-	}
-	return 0
+	return h.peerTS.load(hash.IPAddr(peerIP, peerPort))
 }
 
 // recordPeerTSVal stores the most recently observed peer TCP-timestamp
-// value for the given flow. recv_handle.Read calls it after parseInbound.
-// Lock-free in the steady state: only the first sight of a peer allocates
-// (LoadOrStore), every subsequent update is an atomic.Store.
+// value for the given flow. recv_handle.Read calls it after
+// parseInbound. The store enforces a bounded LRU; tsVal==0 is treated
+// as "no timestamp this packet" and skipped.
 func (h *SendHandle) recordPeerTSVal(peerIP net.IP, peerPort uint16, tsVal uint32) {
-	if tsVal == 0 {
-		return // peer didn't include a timestamp option in this segment
-	}
-	key := hash.IPAddr(peerIP, peerPort)
-	if v, ok := h.peerTS.Load(key); ok {
-		v.(*atomic.Uint32).Store(tsVal)
-		return
-	}
-	slot := new(atomic.Uint32)
-	slot.Store(tsVal)
-	actual, _ := h.peerTS.LoadOrStore(key, slot)
-	if actual != slot {
-		// Lost the race; update the winner's slot.
-		actual.(*atomic.Uint32).Store(tsVal)
-	}
+	h.peerTS.store(hash.IPAddr(peerIP, peerPort), tsVal)
 }
 
 func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
 	key := hash.IPAddr(dstIP, dstPort)
-	h.tcpF.mu.Lock()
-	if e, ok := h.tcpF.clientTCPF[key]; ok {
+	sh := h.tcpF.shardFor(key)
+	sh.mu.Lock()
+	if e, ok := sh.m[key]; ok {
 		// Move-to-front: this client is the most recently used.
-		h.tcpF.lru.MoveToFront(e.elem)
+		sh.lru.MoveToFront(e.elem)
 		f := e.iter.Next()
-		h.tcpF.mu.Unlock()
+		sh.mu.Unlock()
 		return f
 	}
-	h.tcpF.mu.Unlock()
+	sh.mu.Unlock()
 	return h.tcpF.tcpF.Next()
 }
 
@@ -243,33 +259,33 @@ func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
 	a := *addr.(*net.UDPAddr)
 	key := hash.IPAddr(a.IP, uint16(a.Port))
 
-	h.tcpF.mu.Lock()
-	defer h.tcpF.mu.Unlock()
+	sh := h.tcpF.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	if e, ok := h.tcpF.clientTCPF[key]; ok {
+	if e, ok := sh.m[key]; ok {
 		// Same key, fresh iterator. Move to front.
 		e.iter = &iterator.Iterator[conf.TCPF]{Items: f}
-		h.tcpF.lru.MoveToFront(e.elem)
+		sh.lru.MoveToFront(e.elem)
 		return
 	}
 
-	// New key. If we'd exceed the cap, evict the LRU tail. The legitimate
-	// client whose entry is being moved to the LRU tail by attacker-driven
-	// inserts has presumably gone idle (no outbound traffic means no
-	// move-to-front in getClientTCPF) — evicting them costs the protocol-
-	// negotiated flag pattern but isn't a correctness break, since
-	// getClientTCPF falls back to the default LF iterator on a miss.
-	if h.tcpF.lru.Len() >= clientTCPFCap {
-		if tail := h.tcpF.lru.Back(); tail != nil {
+	// New key. If we'd exceed the per-shard cap, evict the LRU tail.
+	// The legitimate client being evicted has presumably gone idle (no
+	// outbound traffic means no move-to-front in getClientTCPF) — losing
+	// the protocol-negotiated flag pattern isn't a correctness break
+	// since getClientTCPF falls back to the global LF iterator on a miss.
+	if sh.lru.Len() >= clientTCPFPerShardCap {
+		if tail := sh.lru.Back(); tail != nil {
 			evictedKey := tail.Value.(uint64)
-			delete(h.tcpF.clientTCPF, evictedKey)
-			h.tcpF.lru.Remove(tail)
-			h.peerTS.Delete(evictedKey)
+			delete(sh.m, evictedKey)
+			sh.lru.Remove(tail)
+			h.peerTS.delete(evictedKey)
 		}
 	}
 
-	elem := h.tcpF.lru.PushFront(key)
-	h.tcpF.clientTCPF[key] = &clientTCPFEntry{
+	elem := sh.lru.PushFront(key)
+	sh.m[key] = &clientTCPFEntry{
 		iter: &iterator.Iterator[conf.TCPF]{Items: f},
 		elem: elem,
 	}
@@ -283,13 +299,14 @@ func (h *SendHandle) dropClientTCPF(addr net.Addr) {
 		return
 	}
 	key := hash.IPAddr(a.IP, uint16(a.Port))
-	h.tcpF.mu.Lock()
-	if e, ok := h.tcpF.clientTCPF[key]; ok {
-		h.tcpF.lru.Remove(e.elem)
-		delete(h.tcpF.clientTCPF, key)
+	sh := h.tcpF.shardFor(key)
+	sh.mu.Lock()
+	if e, ok := sh.m[key]; ok {
+		sh.lru.Remove(e.elem)
+		delete(sh.m, key)
 	}
-	h.tcpF.mu.Unlock()
-	h.peerTS.Delete(key)
+	sh.mu.Unlock()
+	h.peerTS.delete(key)
 }
 
 func (h *SendHandle) Close() {

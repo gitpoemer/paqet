@@ -99,6 +99,11 @@ func copyUWithIdle(dst io.Writer, src UDPEndpoint, idleTimeout time.Duration) er
 			}
 		}
 		if err != nil {
+			if err == io.EOF {
+				// Peer closed cleanly (typically by our partner
+				// direction closing it to unblock us). Clean close.
+				return nil
+			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				// Idle close; not an error to surface.

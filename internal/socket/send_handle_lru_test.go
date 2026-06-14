@@ -14,36 +14,64 @@ func addrKeyImpl(a *net.UDPAddr) uint64 {
 }
 
 func newTestHandle() *SendHandle {
-	return &SendHandle{
+	h := &SendHandle{
 		tcpF: TCPF{
-			tcpF:       iterator.Iterator[conf.TCPF]{Items: []conf.TCPF{{ACK: true, PSH: true}}},
-			clientTCPF: make(map[uint64]*clientTCPFEntry, clientTCPFCap),
-			lru:        list.New(),
+			tcpF: iterator.Iterator[conf.TCPF]{Items: []conf.TCPF{{ACK: true, PSH: true}}},
 		},
+		peerTS: newPeerTSStore(peerTSCap),
 	}
+	for i := range h.tcpF.shards {
+		h.tcpF.shards[i].m = make(map[uint64]*clientTCPFEntry)
+		h.tcpF.shards[i].lru = list.New()
+	}
+	return h
+}
+
+// totalEntries sums the entry count across all shards. Used by tests
+// that don't care which shard a key landed in.
+func (h *SendHandle) totalEntries() int {
+	n := 0
+	for i := range h.tcpF.shards {
+		h.tcpF.shards[i].mu.Lock()
+		n += h.tcpF.shards[i].lru.Len()
+		h.tcpF.shards[i].mu.Unlock()
+	}
+	return n
 }
 
 func mkAddr(a, b, c, d byte, port int) *net.UDPAddr {
 	return &net.UDPAddr{IP: net.IPv4(a, b, c, d), Port: port}
 }
 
-// TestLRU_EvictsTail confirms that when the LRU is full, a fresh insert
-// evicts the LEAST recently used entry — not an arbitrary entry. This
-// is the property that protects active clients from attacker-driven
-// eviction.
+// TestLRU_EvictsTail confirms that within a single shard, the LRU
+// evicts the LEAST recently used entry. Picks three addresses that
+// all hash to the SAME shard so LRU semantics are observable as a
+// single list (sharding splits the global LRU into N independent
+// per-shard LRUs, each preserving the same property).
 func TestLRU_EvictsTail(t *testing.T) {
-	// Use a small cap for the test rather than the real 16k.
 	h := newTestHandle()
-	const cap = 4
-	// Patch the cap via a local helper. We can't change the const at
-	// runtime, so we just insert exactly clientTCPFCap entries and then
-	// verify the (cap+1)th eviction pattern with a smaller working set:
-	// the LRU still evicts back-of-list regardless of cap.
 
-	// Fill with 3 entries; touch the first one to move it to front.
-	a1 := mkAddr(10, 0, 0, 1, 100)
-	a2 := mkAddr(10, 0, 0, 2, 100)
-	a3 := mkAddr(10, 0, 0, 3, 100)
+	// Find three addresses that land in the same shard. Scan a small
+	// address range until we get three colliding hashes.
+	var addrs []*net.UDPAddr
+	var targetShard uint64
+	for octet := byte(0); octet < 200 && len(addrs) < 3; octet++ {
+		a := mkAddr(10, 0, 0, octet, 100)
+		shardIdx := addrKeyImpl(a) % clientTCPFShards
+		if len(addrs) == 0 {
+			targetShard = shardIdx
+			addrs = append(addrs, a)
+			continue
+		}
+		if shardIdx == targetShard {
+			addrs = append(addrs, a)
+		}
+	}
+	if len(addrs) != 3 {
+		t.Fatalf("could not find 3 colliding-shard addresses in [10.0.0.0/24]; got %d", len(addrs))
+	}
+	a1, a2, a3 := addrs[0], addrs[1], addrs[2]
+
 	flags := []conf.TCPF{{ACK: true}}
 	h.setClientTCPF(a1, flags) // [1]
 	h.setClientTCPF(a2, flags) // [2, 1]
@@ -51,69 +79,60 @@ func TestLRU_EvictsTail(t *testing.T) {
 
 	// "Touch" 1 via outbound emission — moves it to front.
 	h.getClientTCPF(a1.IP, uint16(a1.Port))
-	// Order is now [1, 3, 2].
+	// Order in shard: [1, 3, 2].
 
-	// Sanity: front element key matches a1.
-	if got := h.tcpF.lru.Front().Value.(uint64); got == 0 {
-		t.Fatal("front key is zero")
+	shard := h.tcpF.shardFor(addrKey(a1))
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if shard.lru.Front().Value.(uint64) != addrKey(a1) {
+		t.Fatalf("front = %x, want a1 key %x", shard.lru.Front().Value, addrKey(a1))
 	}
-
-	// Verify LRU tail is the OLDEST untouched entry — a2.
-	tailKey := h.tcpF.lru.Back().Value.(uint64)
-	a2Key := addrKey(a2)
-	if tailKey != a2Key {
-		t.Fatalf("LRU tail = %x, want a2 key %x (LRU order broken)", tailKey, a2Key)
+	tailKey := shard.lru.Back().Value.(uint64)
+	if tailKey != addrKey(a2) {
+		t.Fatalf("tail = %x, want a2 key %x (LRU order broken)", tailKey, addrKey(a2))
 	}
-
-	_ = cap
 }
 
 // TestLRU_DropRemovesBoth confirms dropClientTCPF cleans both the map
-// AND the LRU list (matching memory leak fix).
+// AND the LRU list (matching memory leak fix). Works regardless of
+// which shard the key lands in via totalEntries().
 func TestLRU_DropRemovesBoth(t *testing.T) {
 	h := newTestHandle()
 	a := mkAddr(10, 0, 0, 1, 100)
 	h.setClientTCPF(a, []conf.TCPF{{ACK: true}})
 
-	if h.tcpF.lru.Len() != 1 || len(h.tcpF.clientTCPF) != 1 {
-		t.Fatalf("post-insert: lru=%d map=%d, want 1/1", h.tcpF.lru.Len(), len(h.tcpF.clientTCPF))
+	if h.totalEntries() != 1 {
+		t.Fatalf("post-insert: total=%d, want 1", h.totalEntries())
 	}
 
 	h.dropClientTCPF(a)
-	if h.tcpF.lru.Len() != 0 {
-		t.Fatalf("post-drop: lru.Len()=%d, want 0 (list leak)", h.tcpF.lru.Len())
-	}
-	if len(h.tcpF.clientTCPF) != 0 {
-		t.Fatalf("post-drop: map size=%d, want 0", len(h.tcpF.clientTCPF))
+	if h.totalEntries() != 0 {
+		t.Fatalf("post-drop: total=%d, want 0 (list leak)", h.totalEntries())
 	}
 }
 
 // TestLRU_SameKeyUpdatesIterator confirms that setClientTCPF for an
-// existing key replaces the iterator and moves the entry to front,
-// without leaking the old iterator's list element.
+// existing key replaces the iterator without leaking the old entry's
+// list element. Single-key test — sharding irrelevant.
 func TestLRU_SameKeyUpdatesIterator(t *testing.T) {
 	h := newTestHandle()
 	a := mkAddr(10, 0, 0, 1, 100)
-	b := mkAddr(10, 0, 0, 2, 100)
 
 	flagsA := []conf.TCPF{{ACK: true}}
 	flagsB := []conf.TCPF{{SYN: true}}
 
 	h.setClientTCPF(a, flagsA)
-	h.setClientTCPF(b, flagsA)
-	// LRU front = b, back = a
+	if h.totalEntries() != 1 {
+		t.Fatalf("post-first-insert: total=%d, want 1", h.totalEntries())
+	}
 
-	// Re-insert a with different flags. Should move a to front and
-	// replace its iterator.
+	// Re-insert with different flags. Should NOT add a new entry.
 	h.setClientTCPF(a, flagsB)
-	if h.tcpF.lru.Len() != 2 {
-		t.Fatalf("post-update: lru.Len()=%d, want 2 (LRU element leak)", h.tcpF.lru.Len())
-	}
-	if h.tcpF.lru.Front().Value.(uint64) != addrKey(a) {
-		t.Fatal("front is not a after re-insert")
+	if h.totalEntries() != 1 {
+		t.Fatalf("post-update: total=%d, want 1 (entry duplicated)", h.totalEntries())
 	}
 
-	// Returned flag for a should reflect flagsB (SYN), not flagsA (ACK).
+	// Returned flag should reflect flagsB (SYN), not flagsA (ACK).
 	got := h.getClientTCPF(a.IP, uint16(a.Port))
 	if !got.SYN || got.ACK {
 		t.Fatalf("got flags %+v, want SYN-only from flagsB", got)

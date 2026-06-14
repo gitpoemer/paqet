@@ -15,10 +15,13 @@ import (
 func buildPrimedHandle(n int) *SendHandle {
 	sh := &SendHandle{
 		tcpF: TCPF{
-			tcpF:       iterator.Iterator[conf.TCPF]{Items: []conf.TCPF{{ACK: true, PSH: true}}},
-			clientTCPF: make(map[uint64]*clientTCPFEntry, clientTCPFCap),
-			lru:        list.New(),
+			tcpF: iterator.Iterator[conf.TCPF]{Items: []conf.TCPF{{ACK: true, PSH: true}}},
 		},
+		peerTS: newPeerTSStore(peerTSCap),
+	}
+	for i := range sh.tcpF.shards {
+		sh.tcpF.shards[i].m = make(map[uint64]*clientTCPFEntry)
+		sh.tcpF.shards[i].lru = list.New()
 	}
 	flags := []conf.TCPF{{ACK: true, PSH: true}}
 	for _, k := range primeKeys(n) {

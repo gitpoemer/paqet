@@ -2,6 +2,7 @@ package socket
 
 import (
 	"bytes"
+	"container/list"
 	"net"
 	"testing"
 
@@ -93,14 +94,20 @@ func bigEndianPutUint32(b []byte, v uint32) {
 }
 
 func mkTestHandle() *SendHandle {
-	return &SendHandle{
+	h := &SendHandle{
 		srcIPv4:         net.IPv4(10, 0, 0, 1),
 		srcIPv6:         net.ParseIP("2001:db8::1"),
 		srcIPv4RHWA:     net.HardwareAddr{0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x01},
 		srcIPv6RHWA:     net.HardwareAddr{0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x02},
 		cfgInterfaceMAC: net.HardwareAddr{0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0x01},
 		srcPort:         55555,
+		peerTS:          newPeerTSStore(peerTSCap),
 	}
+	for i := range h.tcpF.shards {
+		h.tcpF.shards[i].m = make(map[uint64]*clientTCPFEntry)
+		h.tcpF.shards[i].lru = list.New()
+	}
+	return h
 }
 
 func TestSerializeEquivalence(t *testing.T) {

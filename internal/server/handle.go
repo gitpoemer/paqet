@@ -3,13 +3,28 @@ package server
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"paqet/internal/flog"
 	"paqet/internal/protocol"
 	"paqet/internal/tnet"
 )
 
+// MaxStreamsPerSession caps the number of concurrent server-side streams
+// per smux session. Defense-in-depth against one misbehaving client (or
+// an abuser) opening unbounded streams: each stream pins memory for the
+// relay goroutines + outbound TCP/UDP socket + smux per-stream receive
+// buffer. Without a cap, a single bad session could exhaust server FDs
+// and goroutine memory.
+//
+// 4096 is well above any realistic browser session (50-500 active
+// streams) plus headroom for parallel apps. A session that hits this
+// is either malfunctioning or hostile; we just stop accepting new
+// streams until in-flight ones drain.
+const MaxStreamsPerSession = 4096
+
 func (s *Server) handleConn(ctx context.Context, conn tnet.Conn) {
+	var active atomic.Int32
 	for {
 		select {
 		case <-ctx.Done():
@@ -22,8 +37,22 @@ func (s *Server) handleConn(ctx context.Context, conn tnet.Conn) {
 			flog.Errorf("failed to accept stream on %s: %v", conn.RemoteAddr(), err)
 			return
 		}
+		// Per-session stream cap: if at the limit, drop the new stream
+		// immediately. The cap protects against one bad session
+		// monopolizing server resources; legitimate clients never reach
+		// it. We log once per breach so it's visible but not noisy.
+		if n := active.Add(1); n > MaxStreamsPerSession {
+			active.Add(-1)
+			strm.Close()
+			flog.Errorf("session %s hit MaxStreamsPerSession=%d, rejecting stream %d",
+				conn.RemoteAddr(), MaxStreamsPerSession, strm.SID())
+			continue
+		}
 		s.wg.Go(func() {
-			defer strm.Close()
+			defer func() {
+				active.Add(-1)
+				strm.Close()
+			}()
 			if err := s.handleStrm(ctx, strm); err != nil {
 				flog.Errorf("stream %d from %s closed with error: %v", strm.SID(), strm.RemoteAddr(), err)
 			} else {

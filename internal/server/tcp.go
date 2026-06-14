@@ -22,6 +22,19 @@ func (s *Server) handleTCP(ctx context.Context, strm tnet.Strm, addr string) err
 		flog.Errorf("failed to establish TCP connection to %s for stream %d: %v", addr, strm.SID(), err)
 		return err
 	}
+	// SO_KEEPALIVE on outbound dial: detect dead targets without waiting
+	// for the Linux default of 2h idle. Period of 30s + 9 probes ≈ 4.5
+	// min to declare dead — short enough that zombie streams don't pin
+	// the smux session-wide buffer, long enough that legitimate idle
+	// connections (HTTP/2 keep-alive, WebSocket between messages)
+	// aren't killed. Without this, a target that goes silent (peer
+	// reboot, NAT drop, BGP withdrawal) leaves the relay sitting on
+	// conn.Read forever — exactly the alpha.31 UDP failure mode in TCP
+	// form.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
 	defer func() {
 		conn.Close()
 		flog.Debugf("closed TCP connection %s for stream %d", addr, strm.SID())
