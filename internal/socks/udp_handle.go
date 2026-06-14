@@ -7,9 +7,18 @@ import (
 	"net"
 	"paqet/internal/flog"
 	"paqet/internal/pkg/buffer"
+	"paqet/internal/tnet"
 	"sync"
 	"time"
 )
+
+// udpClient is the subset of *client.Client that the UDP relay needs.
+// Factored out so tests can inject a fake without spinning up real
+// KCP/smux infrastructure.
+type udpClient interface {
+	UDP(lAddr, tAddr string) (tnet.Strm, bool, uint64, error)
+	CloseUDP(key uint64) error
+}
 
 // HandleUDPAssociate runs the SOCKS5 UDP relay for one association.
 //
@@ -34,6 +43,7 @@ func (h *Handler) HandleUDPAssociate(ctx context.Context, udp *net.UDPConn, clie
 	// targets from the same client port multiplex without contention.
 	// Reader goroutines for each stream share this map for cleanup.
 	streams := &udpStreamSet{
+		client:     h.client,
 		udp:        udp,
 		clientAddr: nil, // first datagram fixes this
 		entries:    make(map[string]*udpStreamEntry),
@@ -85,7 +95,7 @@ func (h *Handler) HandleUDPAssociate(ctx context.Context, udp *net.UDPConn, clie
 		}
 
 		target := dg.Dest.String()
-		entry, isNew, err := streams.getOrCreate(h, src, target, dg.Dest)
+		entry, isNew, err := streams.getOrCreate(src, target, dg.Dest)
 		if err != nil {
 			flog.Errorf("SOCKS5 UDP open stream %s -> %s: %v", src, target, err)
 			continue
@@ -108,31 +118,33 @@ func (h *Handler) HandleUDPAssociate(ctx context.Context, udp *net.UDPConn, clie
 
 // udpStreamEntry pins a tunnel stream and the goroutine that reads
 // from it on behalf of one (clientAddr, target) pair.
+//
+// clientKey is the key returned by client.UDP — it identifies the
+// stream in the CLIENT-wide udpPool (shared across all
+// HandleUDPAssociate invocations). We need it so closeOne can call
+// client.CloseUDP and free the cached entry; without that call, the
+// client-wide pool accumulates stale Closed streams forever, and
+// future client.UDP lookups for the same (src, target) pair return
+// the dead pointer and all I/O on it fails. That's the
+// "connection-stops-working-after-a-while" symptom for
+// long-lived-fixed-port UDP flows (QUIC, MTProto, etc).
 type udpStreamEntry struct {
-	key  string
-	strm udpStrm
-	src  *net.UDPAddr // SOCKS5 client UDP source
-	dest AddrSpec
-}
-
-// udpStrm is the subset of tnet.Strm that the UDP relay needs. Helps
-// tests inject mocks.
-type udpStrm interface {
-	io.ReadWriteCloser
-	SetDeadline(time.Time) error
-	SetReadDeadline(time.Time) error
-	SetWriteDeadline(time.Time) error
-	SID() int
+	key       string
+	clientKey uint64
+	strm      tnet.Strm
+	src       *net.UDPAddr // SOCKS5 client UDP source
+	dest      AddrSpec
 }
 
 type udpStreamSet struct {
 	mu         sync.Mutex
+	client     udpClient
 	udp        *net.UDPConn
 	clientAddr *net.UDPAddr
 	entries    map[string]*udpStreamEntry
 }
 
-func (s *udpStreamSet) getOrCreate(h *Handler, src *net.UDPAddr, target string, dest AddrSpec) (*udpStreamEntry, bool, error) {
+func (s *udpStreamSet) getOrCreate(src *net.UDPAddr, target string, dest AddrSpec) (*udpStreamEntry, bool, error) {
 	key := src.String() + "|" + target
 
 	s.mu.Lock()
@@ -142,24 +154,21 @@ func (s *udpStreamSet) getOrCreate(h *Handler, src *net.UDPAddr, target string, 
 	}
 	s.mu.Unlock()
 
-	strmRaw, _, _, err := h.client.UDP(src.String(), target)
+	strm, _, clientKey, err := s.client.UDP(src.String(), target)
 	if err != nil {
 		return nil, false, err
-	}
-	strm, ok := strmRaw.(udpStrm)
-	if !ok {
-		strmRaw.Close()
-		return nil, false, errors.New("client.UDP returned non-udpStrm")
 	}
 
 	s.mu.Lock()
 	if existing, found := s.entries[key]; found {
-		// Lost a race; close ours, return the winner.
+		// Lost a race; close ours, return the winner. Also free the
+		// client-side pool entry we just allocated.
 		s.mu.Unlock()
 		strm.Close()
+		_ = s.client.CloseUDP(clientKey)
 		return existing, false, nil
 	}
-	entry := &udpStreamEntry{key: key, strm: strm, src: src, dest: dest}
+	entry := &udpStreamEntry{key: key, clientKey: clientKey, strm: strm, src: src, dest: dest}
 	s.entries[key] = entry
 	s.mu.Unlock()
 
@@ -194,6 +203,9 @@ func (s *udpStreamSet) readerLoop(e *udpStreamEntry) {
 	}
 }
 
+// closeOne removes the entry from BOTH our local map AND the
+// client-wide udpPool. Failing to do the latter is the bug fixed in
+// alpha.30 — see udpStreamEntry.clientKey comment.
 func (s *udpStreamSet) closeOne(key string) {
 	s.mu.Lock()
 	e, ok := s.entries[key]
@@ -202,6 +214,11 @@ func (s *udpStreamSet) closeOne(key string) {
 	}
 	s.mu.Unlock()
 	if ok {
+		_ = s.client.CloseUDP(e.clientKey)
+		// CloseUDP already closes the strm via udpPool.delete; an
+		// extra Close on a closed tnet.Strm is harmless (idempotent
+		// smux Close), and we use it as defense if CloseUDP changes
+		// to not close in the future.
 		e.strm.Close()
 	}
 }
@@ -215,6 +232,7 @@ func (s *udpStreamSet) closeAll() {
 	s.entries = nil
 	s.mu.Unlock()
 	for _, e := range all {
+		_ = s.client.CloseUDP(e.clientKey)
 		e.strm.Close()
 	}
 }
