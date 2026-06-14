@@ -29,14 +29,15 @@ func (s *Server) handleUDP(ctx context.Context, strm tnet.Strm, addr string) err
 	}()
 	flog.Debugf("UDP connection established to %s for stream %d", addr, strm.SID())
 
-	// Single-goroutine bidi copy. Same pattern as handleTCP — see plan #4.
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- buffer.CopyU(conn, strm)
-	}()
-	inlineErr := buffer.CopyU(strm, conn)
-	_ = conn.Close()
-	bgErr := <-errCh
+	// UDP has no FIN/EOF, so the relay MUST have an idle timeout —
+	// otherwise a single DNS query (one round trip, then silence
+	// forever from both sides) pins 2 goroutines and the smux
+	// per-stream receive buffer until the process restarts.
+	// 486 such zombies were observed in alpha.30 production after
+	// ~113 minutes uptime; cumulative buffer pressure eventually
+	// stalled smux entirely and blocked new stream opens at the
+	// client. See OPTIMIZE_NOTES.md (alpha.31 root-cause).
+	inlineErr, bgErr := buffer.RelayUDPBidi(strm, conn, buffer.DefaultUDPIdleTimeout)
 
 	if ctx.Err() != nil {
 		return nil
