@@ -69,6 +69,24 @@ func parseInboundIPv4(data []byte) (srcIP []byte, srcPort uint16, payload []byte
 		return nil, 0, nil, false
 	}
 
+	// Reject fragments. Bytes [6:8] pack:
+	//   bit 15 = reserved (must be 0)
+	//   bit 14 = DF (may be 0 or 1; we don't care)
+	//   bit 13 = MF
+	//   bits 0-12 = fragment offset
+	//
+	// A safe-to-parse packet has MF=0 AND offset=0 AND reserved=0. That
+	// is, the only bit we tolerate set is DF (0x4000). Any other set bit
+	// means either an unsafe fragment or a malformed/attacker-shaped
+	// header; either way, drop.
+	//
+	// The BPF filter normally prevents non-first fragments from reaching
+	// us at all, but defense-in-depth: don't trust the filter to do
+	// fragmentation-specific reasoning.
+	if (binary.BigEndian.Uint16(ip[6:8]) & 0xBFFF) != 0 {
+		return nil, 0, nil, false
+	}
+
 	// Total length includes IP header + TCP header + payload.
 	totalLen := int(binary.BigEndian.Uint16(ip[2:4]))
 	if totalLen < ipHdrLen {
