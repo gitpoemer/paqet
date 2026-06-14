@@ -192,6 +192,41 @@ cat /proc/$(pidof paqet)/limits | grep "open files"    # process limits
 ss -tn state established | wc -l                       # live sockets count
 ```
 
+## Relay mode (alpha.34 item 10 — experimental)
+
+paqet's TCP relay defaults to `perstream` mode: one BG goroutine per
+active stream doing the strm→conn direction. Memory cost ~4 KB per
+active stream. Simple, predictable, battle-tested.
+
+Alpha.34 added an experimental `coordinator` mode using the vendored
+smux's new `TryRead` + `ReadEvents` APIs. One coordinator goroutine
+per smux session multiplexes readability events across all that
+session's streams; lazy workers spawn only when a stream actually
+has data to forward and exit when its buffer drains.
+
+In `config.yaml`:
+```yaml
+transport:
+  relaymode: coordinator   # default: perstream
+```
+
+When to consider switching:
+- Heavy concurrent stream count per session (one client opening
+  hundreds of streams in parallel).
+- Goroutine-stack memory shows up as the dominant heap cost in
+  `pprof` heap profiles.
+
+Caveats:
+- Each event dispatch goes through `reflect.Select` over the session's
+  stream channels — O(N) per call, N = MaxStreamsPerSession (4096).
+  Adds ~40 μs CPU per dispatched event on commodity x86.
+- Wire format and stealth properties are byte-identical to
+  `perstream` mode. The change is purely about how the BG direction's
+  goroutines are managed.
+- Less production-tested than `perstream`. Stick with the default on
+  critical deployments until you have evidence the coordinator helps
+  your specific workload.
+
 ## Horizontal scaling (>10k users)
 
 At ~10k concurrent users on commodity hardware (8 cores, 32 GB RAM)

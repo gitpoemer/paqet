@@ -14,8 +14,20 @@ type Transport struct {
 	// milliseconds before a UDP relay stream is torn down. 0 ⇒
 	// use buffer.DefaultUDPIdleTimeout (30s). Lower for DNS-heavy
 	// deployments, higher for sticky long-lived UDP (QUIC, MTProto).
-	UDPIdleTimeoutMS int  `yaml:"udpidletimeout"`
-	KCP              *KCP `yaml:"kcp"`
+	UDPIdleTimeoutMS int `yaml:"udpidletimeout"`
+	// RelayMode selects the server-side TCP relay implementation:
+	//   "perstream"   — alpha.28 default. One BG goroutine per stream
+	//                   doing the strm→conn copy. Simple, predictable,
+	//                   memory cost ~4 KB per active stream.
+	//   "coordinator" — alpha.34 item 10. Per-session coordinator
+	//                   goroutine fans out smux ReadEvents to lazy
+	//                   workers. Idle streams cost 0 goroutines; only
+	//                   actively transferring streams have a worker.
+	//                   Wins on memory at high stream count; same
+	//                   stealth properties.
+	// Empty string defaults to "perstream".
+	RelayMode string `yaml:"relaymode"`
+	KCP       *KCP   `yaml:"kcp"`
 }
 
 func (t *Transport) setDefaults(role string) {
@@ -40,6 +52,9 @@ func (t *Transport) setDefaults(role string) {
 	if t.UDPIdleTimeoutMS != 0 && t.UDPIdleTimeoutMS < 500 {
 		t.UDPIdleTimeoutMS = 500
 	}
+	if t.RelayMode == "" {
+		t.RelayMode = "perstream"
+	}
 
 	switch t.Protocol {
 	case "kcp":
@@ -57,6 +72,11 @@ func (t *Transport) validate() []error {
 
 	if t.Conn < 1 || t.Conn > 256 {
 		errors = append(errors, fmt.Errorf("KCP conn must be between 1-256 connections"))
+	}
+
+	validRelayModes := []string{"perstream", "coordinator"}
+	if !slices.Contains(validRelayModes, t.RelayMode) {
+		errors = append(errors, fmt.Errorf("relaymode must be one of: %v", validRelayModes))
 	}
 
 	switch t.Protocol {

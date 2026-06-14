@@ -7,8 +7,23 @@ import (
 
 	"paqet/internal/flog"
 	"paqet/internal/protocol"
+	"paqet/internal/relay"
 	"paqet/internal/tnet"
 )
+
+// relayCtxKey is the context.Value key for the per-session
+// SessionRelay (alpha.34 item 10 coordinator mode). When
+// RelayMode=="coordinator", handleConn attaches one SessionRelay
+// per session and handleTCP uses it instead of spawning a per-stream
+// BG goroutine.
+type relayCtxKey struct{}
+
+func relayFromCtx(ctx context.Context) *relay.SessionRelay {
+	if v, ok := ctx.Value(relayCtxKey{}).(*relay.SessionRelay); ok {
+		return v
+	}
+	return nil
+}
 
 // MaxStreamsPerSession caps the number of concurrent server-side streams
 // per smux session. Defense-in-depth against one misbehaving client (or
@@ -25,6 +40,19 @@ const MaxStreamsPerSession = 4096
 
 func (s *Server) handleConn(ctx context.Context, conn tnet.Conn) {
 	var active atomic.Int32
+
+	// Optionally attach a per-session SessionRelay (alpha.34 item 10).
+	// Configured via transport.relaymode = "coordinator". Per-stream
+	// goroutines are replaced with a shared coordinator + lazy
+	// workers; idle streams cost 0 goroutines. Default mode is
+	// "perstream" which preserves alpha.28 RelayBidi semantics.
+	if s.cfg.Transport.RelayMode == "coordinator" {
+		sr := relay.NewSessionRelay()
+		sr.Start()
+		defer sr.Stop()
+		ctx = context.WithValue(ctx, relayCtxKey{}, sr)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
