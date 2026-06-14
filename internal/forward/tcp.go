@@ -55,24 +55,25 @@ func (f *Forward) handleTCPConn(ctx context.Context, conn net.Conn) error {
 	}()
 	flog.Infof("accepted TCP connection %s -> %s", conn.RemoteAddr(), f.targetAddr)
 
-	errCh := make(chan error, 2)
+	// Single-goroutine bidi copy. See plan #4.
+	errCh := make(chan error, 1)
 	go func() {
-		err := buffer.CopyT(conn, strm)
-		errCh <- err
+		errCh <- buffer.CopyT(conn, strm)
 	}()
-	go func() {
-		err := buffer.CopyT(strm, conn)
-		errCh <- err
-	}()
+	inlineErr := buffer.CopyT(strm, conn)
+	_ = conn.Close()
+	bgErr := <-errCh
 
-	select {
-	case err := <-errCh:
-		if err != nil {
-			flog.Errorf("TCP stream %d failed for %s -> %s: %v", strm.SID(), conn.RemoteAddr(), f.targetAddr, err)
-			return err
-		}
-	case <-ctx.Done():
+	if ctx.Err() != nil {
+		return nil
 	}
-
+	if inlineErr != nil {
+		flog.Errorf("TCP stream %d failed for %s -> %s (out): %v", strm.SID(), conn.RemoteAddr(), f.targetAddr, inlineErr)
+		return inlineErr
+	}
+	if bgErr != nil {
+		flog.Errorf("TCP stream %d failed for %s -> %s (in): %v", strm.SID(), conn.RemoteAddr(), f.targetAddr, bgErr)
+		return bgErr
+	}
 	return nil
 }

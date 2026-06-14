@@ -28,23 +28,35 @@ func (s *Server) handleTCP(ctx context.Context, strm tnet.Strm, addr string) err
 	}()
 	flog.Debugf("TCP connection established to %s for stream %d", addr, strm.SID())
 
-	errChan := make(chan error, 2)
+	// One direction inline + one spawned. When either direction returns
+	// (peer EOF, error, or ctx-cancel-driven close from the defer above),
+	// the conn.Close / strm.Close from the surrounding deferred cleanup
+	// also tears down the OTHER direction's CopyT, so we don't strand the
+	// spawned goroutine. Saves one goroutine per accepted stream vs the
+	// old 2-goroutine pattern. See OPTIMIZE_NOTES.md plan item #4.
+	errCh := make(chan error, 1)
 	go func() {
-		err := buffer.CopyT(conn, strm)
-		errChan <- err
+		errCh <- buffer.CopyT(conn, strm)
 	}()
-	go func() {
-		err := buffer.CopyT(strm, conn)
-		errChan <- err
-	}()
+	inlineErr := buffer.CopyT(strm, conn)
+	// Closing conn here would already happen via the defer at function
+	// exit; closing it now unblocks the spawned CopyT immediately.
+	_ = conn.Close()
+	bgErr := <-errCh
 
-	select {
-	case err := <-errChan:
-		if err != nil {
-			flog.Errorf("TCP stream %d to %s failed: %v", strm.SID(), addr, err)
-			return err
-		}
-	case <-ctx.Done():
+	// Surface the most informative error: ctx-cancel takes priority,
+	// then the inline direction (covers TCP-from-tunnel-to-target),
+	// then the background direction.
+	if ctx.Err() != nil {
+		return nil
+	}
+	if inlineErr != nil {
+		flog.Errorf("TCP stream %d to %s failed (out): %v", strm.SID(), addr, inlineErr)
+		return inlineErr
+	}
+	if bgErr != nil {
+		flog.Errorf("TCP stream %d to %s failed (in): %v", strm.SID(), addr, bgErr)
+		return bgErr
 	}
 	return nil
 }

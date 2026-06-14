@@ -57,23 +57,21 @@ func (h *Handler) handleTCPConnect(conn *net.TCPConn, r *socks5.Request) error {
 	defer strm.Close()
 	flog.Debugf("SOCKS5 stream %d created for %s -> %s", strm.SID(), conn.RemoteAddr(), r.Address())
 
-	errCh := make(chan error, 2)
+	// Single-goroutine bidi copy. See plan #4.
+	errCh := make(chan error, 1)
 	go func() {
-		err := buffer.CopyT(conn, strm)
-		errCh <- err
+		errCh <- buffer.CopyT(conn, strm)
 	}()
-	go func() {
-		err := buffer.CopyT(strm, conn)
-		errCh <- err
-	}()
+	inlineErr := buffer.CopyT(strm, conn)
+	_ = conn.Close()
+	bgErr := <-errCh
 
-	select {
-	case err := <-errCh:
-		if err != nil {
-			flog.Errorf("SOCKS5 stream %d failed for %s -> %s: %v", strm.SID(), conn.RemoteAddr(), r.Address(), err)
-		}
-	case <-h.ctx.Done():
+	if h.ctx.Err() != nil {
 		flog.Debugf("SOCKS5 connection %s -> %s closed due to shutdown", conn.RemoteAddr(), r.Address())
+	} else if inlineErr != nil {
+		flog.Errorf("SOCKS5 stream %d failed for %s -> %s (out): %v", strm.SID(), conn.RemoteAddr(), r.Address(), inlineErr)
+	} else if bgErr != nil {
+		flog.Errorf("SOCKS5 stream %d failed for %s -> %s (in): %v", strm.SID(), conn.RemoteAddr(), r.Address(), bgErr)
 	}
 
 	flog.Debugf("SOCKS5 connection %s -> %s closed", conn.RemoteAddr(), r.Address())

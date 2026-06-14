@@ -29,25 +29,25 @@ func (s *Server) handleUDP(ctx context.Context, strm tnet.Strm, addr string) err
 	}()
 	flog.Debugf("UDP connection established to %s for stream %d", addr, strm.SID())
 
-	errChan := make(chan error, 2)
+	// Single-goroutine bidi copy. Same pattern as handleTCP — see plan #4.
+	errCh := make(chan error, 1)
 	go func() {
-		err := buffer.CopyU(conn, strm)
-		errChan <- err
+		errCh <- buffer.CopyU(conn, strm)
 	}()
-	go func() {
-		err := buffer.CopyU(strm, conn)
-		errChan <- err
-	}()
+	inlineErr := buffer.CopyU(strm, conn)
+	_ = conn.Close()
+	bgErr := <-errCh
 
-	select {
-	case err := <-errChan:
-		if err != nil {
-			flog.Errorf("UDP stream %d to %s failed: %v", strm.SID(), addr, err)
-			return err
-		}
-	case <-ctx.Done():
+	if ctx.Err() != nil {
 		return nil
 	}
-
+	if inlineErr != nil {
+		flog.Errorf("UDP stream %d to %s failed (out): %v", strm.SID(), addr, inlineErr)
+		return inlineErr
+	}
+	if bgErr != nil {
+		flog.Errorf("UDP stream %d to %s failed (in): %v", strm.SID(), addr, bgErr)
+		return bgErr
+	}
 	return nil
 }
