@@ -78,7 +78,15 @@ func (t *TCPF) shardFor(key uint64) *tcpFShard {
 }
 
 type SendHandle struct {
-	handle      *pcap.Handle
+	handle *pcap.Handle
+	// writeMu serializes pcap injection. libpcap's pcap_sendpacket /
+	// WritePacketData is NOT thread-safe, yet one PacketConn (hence one
+	// *pcap.Handle) is shared by every server-side KCP session — each with
+	// its own tx goroutine calling Write concurrently. Only the injection is
+	// guarded; serialization into the pooled scratch buffer stays outside the
+	// lock (sync.Pool is already concurrency-safe). Restores the guard the
+	// hand-rolled emitter rewrite dropped; matches upstream f0b60be.
+	writeMu     sync.Mutex
 	srcIPv4     net.IP
 	srcIPv4RHWA net.HardwareAddr
 	srcIPv6     net.IP
@@ -175,7 +183,9 @@ func (h *SendHandle) Write(payload []byte, addr *net.UDPAddr) error {
 		}
 	}
 	n := h.serializePacketTo(scratch, payload, pf)
+	h.writeMu.Lock()
 	err := h.handle.WritePacketData(scratch[:n])
+	h.writeMu.Unlock()
 	// Reset to full cap before returning to the pool so the next Get sees
 	// the full backing array; serializePacketTo writes from offset 0 so
 	// stale bytes from a previous call are harmless.
