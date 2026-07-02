@@ -30,7 +30,7 @@ func startClient(cfg *conf.Conf) {
 		flog.Fatalf("Failed to initialize client: %v", err)
 	}
 	if err := client.Start(ctx); err != nil {
-		flog.Infof("Client encountered an error: %v", err)
+		flog.Fatalf("Client encountered an error: %v", err)
 	}
 
 	for _, ss := range cfg.SOCKS5 {
@@ -51,7 +51,7 @@ func startClient(cfg *conf.Conf) {
 			flog.Fatalf("Failed to initialize Forward: %v", err)
 		}
 		if err := f.Start(ctx, ff.Protocol); err != nil {
-			flog.Infof("Forward encountered an error: %v", err)
+			flog.Fatalf("Forward encountered an error: %v", err)
 		}
 	}
 
