@@ -163,9 +163,10 @@ func (c *PacketConn) SetClientTCPF(addr net.Addr, f []conf.TCPF) {
 	c.sendHandle.setClientTCPF(addr, f)
 }
 
-// DropClientTCPF evicts the per-remote TCP-flag iterator. Server-side
-// callers should invoke this when a smux session for that peer closes,
-// otherwise the map accumulates a dead entry per ever-connected client.
+// DropClientTCPF evicts the per-remote TCP-flag iterator. Called when a
+// smux session for that peer closes (otherwise the map accumulates a dead
+// entry per ever-connected client) and when a client sends an empty PTCPF
+// to clear its per-client flag override.
 func (c *PacketConn) DropClientTCPF(addr net.Addr) {
 	c.sendHandle.dropClientTCPF(addr)
 }
