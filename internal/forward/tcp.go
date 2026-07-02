@@ -7,18 +7,10 @@ import (
 	"paqet/internal/pkg/buffer"
 )
 
-func (f *Forward) listenTCP(ctx context.Context) error {
-	listener, err := net.Listen("tcp", f.listenAddr)
-	if err != nil {
-		flog.Errorf("failed to bind TCP socket on %s: %v", f.listenAddr, err)
-		return err
-	}
+// serveTCP runs the accept loop on an already-bound listener. Binding and
+// the ctx-driven close happen in startTCP so bind errors surface to Start.
+func (f *Forward) serveTCP(ctx context.Context, listener net.Listener) error {
 	defer listener.Close()
-	go func() {
-		<-ctx.Done()
-		listener.Close()
-	}()
-	flog.Infof("TCP forwarder listening on %s -> %s", f.listenAddr, f.targetAddr)
 
 	for {
 		conn, err := listener.Accept()

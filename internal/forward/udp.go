@@ -9,25 +9,10 @@ import (
 	"time"
 )
 
-func (f *Forward) listenUDP(ctx context.Context) {
-	laddr, err := net.ResolveUDPAddr("udp", f.listenAddr)
-	if err != nil {
-		flog.Errorf("failed to resolve UDP listen address '%s': %v", f.listenAddr, err)
-		return
-	}
-
-	conn, err := net.ListenUDP("udp", laddr)
-	if err != nil {
-		flog.Errorf("failed to bind UDP socket on %s: %v", laddr, err)
-		return
-	}
+// serveUDP runs the receive loop on an already-bound conn. Binding and the
+// ctx-driven close happen in startUDP so bind errors surface to Start.
+func (f *Forward) serveUDP(ctx context.Context, conn *net.UDPConn) {
 	defer conn.Close()
-	go func() {
-		<-ctx.Done()
-		conn.Close()
-	}()
-
-	flog.Infof("UDP forwarder listening on %s -> %s", laddr, f.targetAddr)
 
 	for {
 		select {
@@ -55,8 +40,10 @@ func (f *Forward) handleUDPPacket(ctx context.Context, conn *net.UDPConn) error 
 
 	strm, new, k, err := f.client.UDP(caddr.String(), f.targetAddr)
 	if err != nil {
+		// No CloseUDP here: on the create-error path k is 0 (no pooled
+		// stream), so CloseUDP(k) is a no-op that just takes a lock and
+		// logs a spurious "key 0 not found". Matches upstream b80fce8.
 		flog.Errorf("failed to establish UDP stream for %s -> %s: %v", caddr, f.targetAddr, err)
-		f.client.CloseUDP(k)
 		return err
 	}
 
@@ -86,9 +73,12 @@ func (f *Forward) handleUDPStrm(ctx context.Context, k uint64, strm tnet.Strm, c
 			return
 		default:
 		}
-		strm.SetDeadline(time.Now().Add(8 * time.Second))
+		// SetReadDeadline, not SetDeadline: handleUDPPacket writes to this
+		// same strm concurrently, and SetDeadline would clobber that
+		// writer's deadline. Matches upstream c680429.
+		strm.SetReadDeadline(time.Now().Add(8 * time.Second))
 		n, err := strm.Read(buf)
-		strm.SetDeadline(time.Time{})
+		strm.SetReadDeadline(time.Time{})
 		if err != nil {
 			flog.Errorf("UDP stream %d read failed for %s -> %s: %v", strm.SID(), caddr, f.targetAddr, err)
 			return
