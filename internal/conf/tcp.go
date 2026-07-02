@@ -51,6 +51,18 @@ func (t *TCP) validate() []error {
 	if len(t.LF) == 0 || len(t.RF) == 0 {
 		errors = append(errors, fmt.Errorf("at least one TCP flag combination required"))
 	}
+
+	// Cap the flag-combination list length. The wire format carries the
+	// count in a single byte and the iterator cycles the list per packet;
+	// a runaway config buys nothing. Matches upstream 248c241.
+	maxTCPFLen := 64
+	if len(t.LF_) > maxTCPFLen {
+		errors = append(errors, fmt.Errorf("local_flag exceeds max %d", maxTCPFLen))
+	}
+	if len(t.RF_) > maxTCPFLen {
+		errors = append(errors, fmt.Errorf("remote_flag exceeds max %d", maxTCPFLen))
+	}
+
 	return errors
 }
 
