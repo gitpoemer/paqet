@@ -74,7 +74,13 @@ func (s *Server) handleStrm(ctx context.Context, strm tnet.Strm) error {
 	case protocol.PPING:
 		return s.handlePing(strm)
 	case protocol.PTCPF:
-		if len(p.TCPF) != 0 {
+		// An empty flag list means the client is clearing its per-client
+		// TCP-flag override; drop the entry so it stops using stale flags
+		// instead of no-oping and leaving them until the conn closes.
+		// Matches upstream 5a61370.
+		if len(p.TCPF) == 0 {
+			s.pConn.DropClientTCPF(strm.RemoteAddr())
+		} else {
 			s.pConn.SetClientTCPF(strm.RemoteAddr(), p.TCPF)
 		}
 		return nil
