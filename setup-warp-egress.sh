@@ -16,7 +16,13 @@
 #   sudo ./setup-warp-egress.sh setup        # non-interactive actions
 #   sudo ./setup-warp-egress.sh test
 #   sudo ./setup-warp-egress.sh status
+#   sudo ./setup-warp-egress.sh failclosed   # switch fail mode live
+#   sudo ./setup-warp-egress.sh failopen
 #   sudo ./setup-warp-egress.sh teardown
+#
+# Fail mode (WARP down): setup prompts interactively (default fail-closed).
+# Override non-interactively with WARP_FAILOPEN=1, or switch later with the
+# failclosed/failopen subcommands (menu items 4/5).
 #
 # Tunables (env overrides):
 #   WARP_IFACE (warp)  WARP_TABLE (51820)  WARP_MARK (1)  WARP_RULE_PRIO (1000)
@@ -38,6 +44,7 @@ MARKHEX="0x$(printf '%x' "$MARK")"
 # real IP. Set WARP_FAILOPEN=1 to instead let it fall through to normal
 # routing (leaks real IP on WARP outage, but keeps connectivity).
 FAILOPEN="${WARP_FAILOPEN:-0}"
+FAILOPEN_EXPLICIT="${WARP_FAILOPEN+1}"   # non-empty if the env var was set
 
 # ── output helpers ───────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -225,6 +232,10 @@ up() {
   if [ "$FAILOPEN" != "1" ]; then
     ip -4 route replace blackhole default table "$TABLE" metric 1000
     ip -6 route replace blackhole default table "$TABLE" metric 1000 2>/dev/null || true
+  else
+    # fail-open: ensure no blackhole floor remains (idempotent mode switch)
+    ip -4 route del blackhole default table "$TABLE" metric 1000 2>/dev/null || true
+    ip -6 route del blackhole default table "$TABLE" metric 1000 2>/dev/null || true
   fi
 }
 down() {
@@ -258,7 +269,10 @@ ExecStop=/usr/local/sbin/warp-egress-guard down
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now "$GUARD_UNIT" >/dev/null 2>&1 || die "failed to enable $GUARD_UNIT"
+    systemctl enable "$GUARD_UNIT" >/dev/null 2>&1 || die "failed to enable $GUARD_UNIT"
+    # restart (not just enable --now) so a re-run re-executes ExecStart and
+    # applies a changed fail mode.
+    systemctl restart "$GUARD_UNIT" || die "failed to start $GUARD_UNIT"
   else
     warn "no systemd — applying guard directly (will NOT persist across reboot)"
     /usr/local/sbin/warp-egress-guard up
@@ -282,6 +296,32 @@ bring_up() {
 }
 
 # ── actions ──────────────────────────────────────────────────────────────
+# prompt_failmode asks fail-closed vs fail-open interactively, unless the
+# WARP_FAILOPEN env var was set explicitly (then honor it) or stdin is not
+# a TTY (then keep the fail-closed default).
+prompt_failmode() {
+  [ -n "$FAILOPEN_EXPLICIT" ] && { info "fail mode from WARP_FAILOPEN=$FAILOPEN"; return 0; }
+  [ -t 0 ] || return 0
+  echo
+  echo "When WARP is down, marked egress should:"
+  echo "  1) Fail-closed  (recommended) — DROP it; never leak the real IP"
+  echo "  2) Fail-open                  — fall back to the real IP (keeps"
+  echo "                                  connectivity, but leaks on outage)"
+  local fm; read -rp "select [1]> " fm || fm=1
+  case "${fm:-1}" in
+    2|open|o) FAILOPEN=1 ;;
+    *)        FAILOPEN=0 ;;
+  esac
+}
+
+do_setmode() {
+  require_root
+  FAILOPEN="$1"
+  [ -x /usr/local/sbin/warp-egress-guard ] || die "guard not installed — run setup first"
+  install_guard
+  ok "egress is now $([ "$1" = 1 ] && echo 'FAIL-OPEN (leaks real IP on WARP outage)' || echo 'FAIL-CLOSED (drops on WARP outage)')"
+}
+
 do_setup() {
   require_root
   ensure_deps
@@ -289,6 +329,7 @@ do_setup() {
   wgcf_profile
   build_wg_conf
   apply_sysctl
+  prompt_failmode
   install_guard
   bring_up
   echo
@@ -461,9 +502,11 @@ ${C_B}=== paqet WARP egress ===${C_RST}  iface=${IFACE} table=${TABLE} mark=${MA
   1) Setup / update WARP egress (idempotent)
   2) Test WARP table (marked request to google.com)
   3) Show status
-  4) Route system DNS through WARP (optional)
-  5) Stop routing system DNS through WARP
-  6) Teardown / uninstall
+  4) Switch to fail-closed (drop on WARP outage)
+  5) Switch to fail-open  (leak real IP on WARP outage)
+  6) Route system DNS through WARP (optional)
+  7) Stop routing system DNS through WARP
+  8) Teardown / uninstall
   0) Exit
 EOF
     read -rp "select> " choice || { echo; exit 0; }
@@ -471,9 +514,11 @@ EOF
       1) do_setup ;;
       2) do_test  || warn "test reported a failure" ;;
       3) do_status ;;
-      4) do_dns_on ;;
-      5) do_dns_off ;;
-      6) do_teardown ;;
+      4) do_setmode 0 ;;
+      5) do_setmode 1 ;;
+      6) do_dns_on ;;
+      7) do_dns_off ;;
+      8) do_teardown ;;
       0|q|quit|exit) exit 0 ;;
       *) warn "invalid choice: $choice" ;;
     esac
@@ -486,12 +531,14 @@ main() {
     setup)     do_setup ;;
     test)      do_test ;;
     status)    do_status ;;
+    failclosed|fail-closed) do_setmode 0 ;;
+    failopen|fail-open)     do_setmode 1 ;;
     dns-on)    do_dns_on ;;
     dns-off)   do_dns_off ;;
     teardown|uninstall) do_teardown ;;
     -h|--help|help)
       grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//' | head -40 ;;
-    *) die "unknown command: $1 (try: setup|test|status|dns-on|dns-off|teardown, or no arg for menu)" ;;
+    *) die "unknown command: $1 (try: setup|test|status|failclosed|failopen|dns-on|dns-off|teardown, or no arg for menu)" ;;
   esac
 }
 main "$@"

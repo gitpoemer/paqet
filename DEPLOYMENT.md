@@ -249,5 +249,7 @@ Caveats:
 - Linux only (`egress_mark` is a no-op on other platforms).
 - Fail-closed by default: if the WARP interface drops, marked egress is
   dropped (a blackhole floor in the routing table) rather than silently
-  leaking out the real server IP. Re-run the script with `WARP_FAILOPEN=1`
-  to prefer connectivity over leak-safety.
+  leaking out the real server IP. Setup prompts for the mode (default
+  fail-closed); switch anytime with `setup-warp-egress.sh failopen` /
+  `failclosed` (menu items 4/5), or preset non-interactively with
+  `WARP_FAILOPEN=1`.
