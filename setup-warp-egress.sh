@@ -13,9 +13,12 @@
 # Idempotent + interactive. Run as root.
 #
 #   sudo ./setup-warp-egress.sh              # interactive menu
-#   curl -fsSL <url> | sudo bash             # menu also works when piped
-#   curl -fsSL <url> | sudo bash -s setup    # non-interactive one-shot
 #   sudo ./setup-warp-egress.sh setup        # non-interactive actions
+#
+# Run straight from the branch tip:
+#   curl -fsSL https://raw.githubusercontent.com/gitpoemer/paqet/optimize/setup-warp-egress.sh | sudo bash
+#   # non-interactive one-shot:
+#   curl -fsSL https://raw.githubusercontent.com/gitpoemer/paqet/optimize/setup-warp-egress.sh | sudo bash -s setup
 #   sudo ./setup-warp-egress.sh test
 #   sudo ./setup-warp-egress.sh status
 #   sudo ./setup-warp-egress.sh failclosed   # switch fail mode live
