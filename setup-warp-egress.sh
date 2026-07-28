@@ -13,6 +13,8 @@
 # Idempotent + interactive. Run as root.
 #
 #   sudo ./setup-warp-egress.sh              # interactive menu
+#   curl -fsSL <url> | sudo bash             # menu also works when piped
+#   curl -fsSL <url> | sudo bash -s setup    # non-interactive one-shot
 #   sudo ./setup-warp-egress.sh setup        # non-interactive actions
 #   sudo ./setup-warp-egress.sh test
 #   sudo ./setup-warp-egress.sh status
@@ -525,9 +527,26 @@ EOF
   done
 }
 
+# When piped (curl ... | sudo bash) the script body IS stdin, so interactive
+# `read`s hit EOF immediately. Reattach stdin to the controlling terminal so
+# the menu actually waits for input.
+attach_tty() {
+  [ -t 0 ] && return 0
+  # Test we can actually OPEN the controlling terminal (a readable /dev/tty
+  # node can still fail with ENXIO when there is no controlling tty), so the
+  # exec below can't blow up mid-redirect.
+  if { : </dev/tty; } 2>/dev/null; then
+    exec </dev/tty
+  else
+    die "no terminal available for the interactive menu. Either download first
+  (curl -fsSL <url> -o setup-warp-egress.sh && sudo bash setup-warp-egress.sh)
+  or run a non-interactive subcommand, e.g.:  ... | sudo bash -s setup"
+  fi
+}
+
 main() {
   case "${1:-menu}" in
-    menu|"")   require_root; menu ;;
+    menu|"")   require_root; attach_tty; menu ;;
     setup)     do_setup ;;
     test)      do_test ;;
     status)    do_status ;;
