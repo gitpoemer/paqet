@@ -168,19 +168,21 @@ wgcf_profile() {
 # ── build the wg-quick config from the wgcf profile ──────────────────────
 build_wg_conf() {
   local src="$WGCF_DIR/wgcf-profile.conf"
-  local priv addr6 addr4 pub endpoint
+  local priv pub endpoint addr_line has_v6=""
   # Split on the FIRST '=' only — base64 WireGuard keys end in '=' / '==',
   # so an '= *' field split would eat the padding and corrupt the key.
   priv=$(sed -n 's/^PrivateKey[[:space:]]*=[[:space:]]*//p' "$src" | head -1)
   pub=$(sed -n 's/^PublicKey[[:space:]]*=[[:space:]]*//p' "$src" | head -1)
   endpoint=$(sed -n 's/^Endpoint[[:space:]]*=[[:space:]]*//p' "$src" | head -1)
-  # wgcf lists two Address lines (v4 /32, v6 /128)
-  addr4=$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$src" | grep -E '^[0-9]+\.' | head -1)
-  addr6=$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$src" | grep ':' | head -1)
-  [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$endpoint" ] || die "could not parse wgcf profile"
-
-  local addr_line="$addr4"
-  [ -n "$addr6" ] && addr_line="$addr4, $addr6"
+  # Address may be ONE line ("v4, v6") or TWO lines, depending on the wgcf
+  # version. Collect every token, trim, de-dup, rejoin. (A per-family parse
+  # + rejoin duplicated the v4 → wg-quick "Address already assigned".)
+  addr_line=$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$src" \
+    | tr ',' '\n' \
+    | awk '{gsub(/[[:space:]]+/,"")} NF && !seen[$0]++ {a[++n]=$0} END{for(i=1;i<=n;i++) printf "%s%s",(i>1?", ":""),a[i]}')
+  case "$addr_line" in *:*) has_v6=1 ;; esac
+  [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$endpoint" ] && [ -n "$addr_line" ] \
+    || die "could not parse wgcf profile"
 
   info "writing $WG_CONF (Table=off; fwmark $MARKHEX -> table $TABLE)"
   mkdir -p /etc/wireguard; chmod 700 /etc/wireguard
@@ -201,7 +203,7 @@ build_wg_conf() {
     # and the guard's higher-metric blackhole takes over (fail closed).
     echo "PostUp = ip -4 route replace default dev %i table $TABLE metric 100"
     echo "PreDown = /bin/sh -c 'ip -4 route del default dev %i table $TABLE metric 100 2>/dev/null || true'"
-    if [ -n "$addr6" ]; then
+    if [ -n "$has_v6" ]; then
       echo "PostUp = ip -6 route replace default dev %i table $TABLE metric 100"
       echo "PreDown = /bin/sh -c 'ip -6 route del default dev %i table $TABLE metric 100 2>/dev/null || true'"
     fi
@@ -308,6 +310,10 @@ bring_up() {
   if iface_up; then
     info "$IFACE exists — reloading config"
     wg-quick down "$IFACE" >/dev/null 2>&1 || true
+    # If it was created outside wg-quick (a prior failed manual run),
+    # wg-quick down can't remove it — delete the link directly so the
+    # up below doesn't hit "Address already assigned".
+    ip link del "$IFACE" 2>/dev/null || true
   fi
   if have_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^wg-quick@'; then
     systemctl enable "wg-quick@${IFACE}" >/dev/null 2>&1 || true
