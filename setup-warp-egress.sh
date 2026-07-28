@@ -78,9 +78,17 @@ detect_pkg_mgr() {
 pkg_install() {
   # $@ = package names
   case "$PKG" in
-    apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
-              && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                   -o Dpkg::Options::=--force-confold "$@" ;;
+    apt)
+      # No -qq: keep apt output visible so a slow mirror/update doesn't look
+      # like a freeze. Bounded timeouts so a dead mirror can't hang forever.
+      info "apt-get update (fetching package lists — can take ~30s) ..."
+      DEBIAN_FRONTEND=noninteractive apt-get update \
+        -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 || \
+        warn "apt-get update had issues; trying install anyway"
+      info "apt-get install: $* ..."
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Acquire::Retries=3 -o Dpkg::Options::=--force-confold "$@"
+      ;;
     dnf)    dnf install -y "$@" ;;
     yum)    yum install -y "$@" ;;
     pacman) pacman -Sy --noconfirm "$@" ;;
