@@ -315,13 +315,21 @@ bring_up() {
     # up below doesn't hit "Address already assigned".
     ip link del "$IFACE" 2>/dev/null || true
   fi
-  if have_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^wg-quick@'; then
+  # Prefer systemd for persistence. wg-quick@ is a standard template shipped
+  # with wireguard-tools; don't gate on list-unit-files (unreliable right
+  # after install). Only fall back to a manual bring-up if systemctl itself
+  # fails or systemd isn't running as init.
+  if have_systemd; then
     systemctl enable "wg-quick@${IFACE}" >/dev/null 2>&1 || true
-    systemctl restart "wg-quick@${IFACE}" || die "systemctl start wg-quick@${IFACE} failed"
+    if systemctl restart "wg-quick@${IFACE}" 2>/dev/null; then
+      return 0
+    fi
+    warn "systemctl start of wg-quick@${IFACE} failed; falling back to manual bring-up"
+    warn "  see: systemctl status wg-quick@${IFACE} / journalctl -u wg-quick@${IFACE}"
   else
-    warn "systemd/wg-quick unit not available — bringing up manually (won't persist across reboot)"
-    wg-quick up "$IFACE" || die "wg-quick up $IFACE failed"
+    warn "systemd not running as init — manual bring-up (won't persist across reboot)"
   fi
+  wg-quick up "$IFACE" || die "wg-quick up $IFACE failed"
 }
 
 # ── actions ──────────────────────────────────────────────────────────────
