@@ -15,7 +15,15 @@ type Transport struct {
 	// use buffer.DefaultUDPIdleTimeout (30s). Lower for DNS-heavy
 	// deployments, higher for sticky long-lived UDP (QUIC, MTProto).
 	UDPIdleTimeoutMS int  `yaml:"udpidletimeout"`
-	KCP              *KCP `yaml:"kcp"`
+	// EgressMark is the SO_MARK (Linux fwmark) stamped on server-side
+	// egress sockets — the TCP/UDP connections the server opens to the
+	// real targets. 0 ⇒ disabled (normal routing). Set it (e.g. 1) to
+	// pair with a policy-routing rule that sends marked packets out a
+	// WARP/WireGuard interface, so only forwarded traffic egresses via
+	// Cloudflare while the tunnel's own control traffic stays on the
+	// real interface. Linux-only; ignored on other platforms.
+	EgressMark int  `yaml:"egress_mark"`
+	KCP        *KCP `yaml:"kcp"`
 }
 
 func (t *Transport) setDefaults(role string) {
@@ -57,6 +65,11 @@ func (t *Transport) validate() []error {
 
 	if t.Conn < 1 || t.Conn > 256 {
 		errors = append(errors, fmt.Errorf("KCP conn must be between 1-256 connections"))
+	}
+
+	// SO_MARK is a uint32. Reject negatives and anything past the range.
+	if t.EgressMark < 0 || t.EgressMark > 0xFFFFFFFF {
+		errors = append(errors, fmt.Errorf("egress_mark must be between 0 and 4294967295"))
 	}
 
 	switch t.Protocol {
