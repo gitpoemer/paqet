@@ -213,3 +213,37 @@ Caveat for paqet's pcap-based design: the LB cannot terminate KCP
 (it's our application layer over raw TCP). It needs to operate at IP
 layer — DNAT-style or anycast routing. HAProxy in `mode tcp` with
 `source` balance algorithm works for the carrier-TCP flows.
+
+## Egress via Cloudflare WARP (optional)
+
+Route only the server's *forwarded* traffic (the connections it opens to
+real targets) out a Cloudflare WARP WireGuard interface, so those flows
+egress from a Cloudflare IP — while the paqet tunnel's own control traffic
+(client ↔ server KCP) keeps using the real interface.
+
+Mechanism: the server stamps `SO_MARK` on every egress socket (TCP+UDP)
+via `transport.egress_mark`; a policy-routing rule sends marked packets
+into a dedicated table whose default route is the WARP interface.
+
+Setup:
+
+```bash
+sudo ./setup-warp-egress.sh          # interactive menu (setup / test / status / teardown)
+# then in the server config:
+#   transport:
+#     egress_mark: 1
+sudo systemctl restart paqet         # or however you run it
+sudo ./setup-warp-egress.sh test     # marks a real TCP request to google.com
+                                     # through the WARP table and confirms warp=on
+```
+
+Caveats:
+- Requires root (CAP_NET_ADMIN for SO_MARK; the server already needs
+  CAP_NET_RAW for pcap).
+- WARP free is best-effort/deprioritized and egresses from *shared*
+  Cloudflare datacenter IPs — many sites captcha or block those, so this
+  can hurt as much as help depending on the target. Not a dedicated IP.
+- DNS: hostname resolution the server does is not marked by default. Use
+  the script's "Route system DNS through WARP" option, or hand the server
+  pre-resolved IPs, if you need DNS to egress via WARP too.
+- Linux only (`egress_mark` is a no-op on other platforms).

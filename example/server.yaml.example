@@ -43,6 +43,13 @@ transport:
   # tcpbuf: 8192   # TCP buffer size in bytes
   # udpbuf: 4096   # UDP buffer size in bytes
 
+  # egress_mark: 1 # (server, Linux) SO_MARK stamped on outbound target
+  #                # sockets (TCP+UDP). Pair with a policy-routing rule to
+  #                # send only forwarded traffic out a WARP/WireGuard iface
+  #                # (egress via Cloudflare) while tunnel control traffic
+  #                # stays on the real interface. See setup-warp-egress.sh.
+  #                # 0/unset = disabled. Requires root (CAP_NET_ADMIN).
+
   # KCP protocol settings
   kcp:
     mode: "fast"              # KCP mode: normal, fast, fast2, fast3, manual
