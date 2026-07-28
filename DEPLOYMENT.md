@@ -247,3 +247,7 @@ Caveats:
   the script's "Route system DNS through WARP" option, or hand the server
   pre-resolved IPs, if you need DNS to egress via WARP too.
 - Linux only (`egress_mark` is a no-op on other platforms).
+- Fail-closed by default: if the WARP interface drops, marked egress is
+  dropped (a blackhole floor in the routing table) rather than silently
+  leaking out the real server IP. Re-run the script with `WARP_FAILOPEN=1`
+  to prefer connectivity over leak-safety.

@@ -30,7 +30,14 @@ RULE_PRIO="${WARP_RULE_PRIO:-1000}"
 WGCF_DIR="/etc/warp-egress"
 WG_CONF="/etc/wireguard/${IFACE}.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-warp-egress.conf"
+GUARD_UNIT="warp-egress-guard.service"
+GUARD_PATH="/etc/systemd/system/${GUARD_UNIT}"
 MARKHEX="0x$(printf '%x' "$MARK")"
+# Fail-closed by default: if the WARP interface is down/broken, marked
+# egress is DROPPED (blackhole floor) rather than silently leaking out the
+# real IP. Set WARP_FAILOPEN=1 to instead let it fall through to normal
+# routing (leaks real IP on WARP outage, but keeps connectivity).
+FAILOPEN="${WARP_FAILOPEN:-0}"
 
 # ── output helpers ───────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -157,14 +164,16 @@ build_wg_conf() {
     # NOTE: the wgcf DNS= line is deliberately dropped — wg-quick would
     # rewrite the host's /etc/resolv.conf globally. DNS is handled separately.
     echo "Table = off"
-    # Default route lives only in our private table; marked packets use it.
-    echo "PostUp = ip -4 route replace default dev %i table $TABLE"
-    echo "PostUp = /bin/sh -c 'ip -4 rule del fwmark $MARK table $TABLE priority $RULE_PRIO 2>/dev/null; ip -4 rule add fwmark $MARK table $TABLE priority $RULE_PRIO'"
-    echo "PreDown = /bin/sh -c 'ip -4 rule del fwmark $MARK table $TABLE priority $RULE_PRIO 2>/dev/null || true'"
+    # wg-quick only owns the PREFERRED route (metric 100). The fwmark rule
+    # and the fail-closed blackhole floor live in the guard unit so they
+    # persist across a WARP outage — otherwise a crash would leak marked
+    # traffic out the real IP. When the iface drops, this route vanishes
+    # and the guard's higher-metric blackhole takes over (fail closed).
+    echo "PostUp = ip -4 route replace default dev %i table $TABLE metric 100"
+    echo "PreDown = /bin/sh -c 'ip -4 route del default dev %i table $TABLE metric 100 2>/dev/null || true'"
     if [ -n "$addr6" ]; then
-      echo "PostUp = ip -6 route replace default dev %i table $TABLE"
-      echo "PostUp = /bin/sh -c 'ip -6 rule del fwmark $MARK table $TABLE priority $RULE_PRIO 2>/dev/null; ip -6 rule add fwmark $MARK table $TABLE priority $RULE_PRIO'"
-      echo "PreDown = /bin/sh -c 'ip -6 rule del fwmark $MARK table $TABLE priority $RULE_PRIO 2>/dev/null || true'"
+      echo "PostUp = ip -6 route replace default dev %i table $TABLE metric 100"
+      echo "PreDown = /bin/sh -c 'ip -6 route del default dev %i table $TABLE metric 100 2>/dev/null || true'"
     fi
     echo ""
     echo "[Peer]"
@@ -188,6 +197,74 @@ apply_sysctl() {
   sysctl -q -p "$SYSCTL_FILE" || warn "sysctl apply reported an issue (continuing)"
 }
 
+have_systemd() {
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+# install_guard writes a self-contained guard script (values baked in) that
+# owns the fwmark ip rule plus, unless fail-open, a high-metric blackhole
+# default in the table. It persists via a systemd unit so a WARP outage
+# fails CLOSED (marked egress dropped) instead of leaking out the real IP.
+install_guard() {
+  local mode; [ "$FAILOPEN" = "1" ] && mode="fail-OPEN (leaks real IP on WARP outage)" || mode="fail-closed floor"
+  info "installing egress guard: fwmark $MARKHEX -> table $TABLE ($mode)"
+  cat > /usr/local/sbin/warp-egress-guard <<EOF
+#!/usr/bin/env bash
+set -u
+TABLE=$TABLE
+MARK=$MARK
+RULE_PRIO=$RULE_PRIO
+FAILOPEN=$FAILOPEN
+EOF
+  cat >> /usr/local/sbin/warp-egress-guard <<'EOF'
+up() {
+  ip -4 rule del fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO" 2>/dev/null || true
+  ip -4 rule add fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO"
+  ip -6 rule del fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO" 2>/dev/null || true
+  ip -6 rule add fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO" 2>/dev/null || true
+  if [ "$FAILOPEN" != "1" ]; then
+    ip -4 route replace blackhole default table "$TABLE" metric 1000
+    ip -6 route replace blackhole default table "$TABLE" metric 1000 2>/dev/null || true
+  fi
+}
+down() {
+  ip -4 rule del fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO" 2>/dev/null || true
+  ip -6 rule del fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO" 2>/dev/null || true
+  ip -4 route del blackhole default table "$TABLE" metric 1000 2>/dev/null || true
+  ip -6 route del blackhole default table "$TABLE" metric 1000 2>/dev/null || true
+}
+case "${1:-}" in
+  up)   up ;;
+  down) down ;;
+  *) echo "usage: $0 up|down" >&2; exit 1 ;;
+esac
+EOF
+  chmod 755 /usr/local/sbin/warp-egress-guard
+
+  if have_systemd; then
+    cat > "$GUARD_PATH" <<EOF
+[Unit]
+Description=paqet WARP egress guard (fwmark rule + fail-closed floor)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/warp-egress-guard up
+ExecStop=/usr/local/sbin/warp-egress-guard down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "$GUARD_UNIT" >/dev/null 2>&1 || die "failed to enable $GUARD_UNIT"
+  else
+    warn "no systemd — applying guard directly (will NOT persist across reboot)"
+    /usr/local/sbin/warp-egress-guard up
+  fi
+}
+
 iface_up() { ip link show "$IFACE" >/dev/null 2>&1; }
 
 bring_up() {
@@ -195,7 +272,7 @@ bring_up() {
     info "$IFACE exists — reloading config"
     wg-quick down "$IFACE" >/dev/null 2>&1 || true
   fi
-  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^wg-quick@'; then
+  if have_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^wg-quick@'; then
     systemctl enable "wg-quick@${IFACE}" >/dev/null 2>&1 || true
     systemctl restart "wg-quick@${IFACE}" || die "systemctl start wg-quick@${IFACE} failed"
   else
@@ -212,6 +289,7 @@ do_setup() {
   wgcf_profile
   build_wg_conf
   apply_sysctl
+  install_guard
   bring_up
   echo
   ok "WARP egress is up."
@@ -230,8 +308,11 @@ on the real interface.
 
 Routing summary:
   iface  : ${IFACE}
-  table  : ${TABLE}   (default route -> ${IFACE})
-  rule   : fwmark ${MARKHEX} -> table ${TABLE} (prio ${RULE_PRIO})
+  table  : ${TABLE}   (dev ${IFACE} metric 100 $( [ "$FAILOPEN" = 1 ] && echo '(fail-open)' || echo '+ blackhole metric 1000 = fail-closed'))
+  rule   : fwmark ${MARKHEX} -> table ${TABLE} (prio ${RULE_PRIO}, persisted by ${GUARD_UNIT})
+
+Fail-closed: if WARP drops, marked egress is DROPPED (not leaked out the
+real IP). Re-run with WARP_FAILOPEN=1 to prefer connectivity over leak-safety.
 
 Run '${0##*/} test' to verify the marked path reaches google.com via WARP.
 EOF
@@ -276,7 +357,7 @@ do_test() {
     || err "table $TABLE has NO default route"
 
   echo
-  trap _cleanup_test EXIT
+  trap _cleanup_test EXIT INT TERM
   info "baseline egress (unmarked, normal route):"
   local base_ip base_trace
   base_trace=$(curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
@@ -297,7 +378,7 @@ do_test() {
   grsp=$(_marked_curl www.google.com / | head -c 120 || true)
   if [ -n "$grsp" ]; then ok "google.com responded through the WARP table"; else err "google.com did NOT respond through the WARP table"; fi
 
-  _cleanup_test; trap - EXIT
+  _cleanup_test; trap - EXIT INT TERM
 
   echo
   if [ "${warp_flag:-off}" = "on" ] && [ -n "$warp_ip" ] && [ "$warp_ip" != "$base_ip" ]; then
@@ -319,7 +400,14 @@ do_status() {
   fi
   echo "rule:";  ip rule show | grep "lookup $TABLE" | sed 's/^/    /' || echo "    (none)"
   echo "table $TABLE routes:"; ip route show table "$TABLE" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
-  echo "systemd:"; systemctl is-enabled "wg-quick@${IFACE}" 2>/dev/null | sed 's/^/    enabled=/' || true
+  echo "guard:"
+  if have_systemd; then
+    printf '    %s: %s (%s)\n' "$GUARD_UNIT" \
+      "$(systemctl is-active "$GUARD_UNIT" 2>/dev/null || echo inactive)" \
+      "$(systemctl is-enabled "$GUARD_UNIT" 2>/dev/null || echo disabled)"
+  fi
+  ip route show table "$TABLE" 2>/dev/null | grep -q blackhole && echo "    fail-closed: blackhole floor present" || echo "    fail-open: no blackhole floor"
+  echo "systemd:"; systemctl is-enabled "wg-quick@${IFACE}" 2>/dev/null | sed 's/^/    wg-quick enabled=/' || true
 }
 
 do_dns_on() {
@@ -345,10 +433,19 @@ do_teardown() {
   info "tearing down WARP egress ..."
   wg-quick down "$IFACE" >/dev/null 2>&1 || true
   systemctl disable "wg-quick@${IFACE}" >/dev/null 2>&1 || true
-  # belt-and-suspenders rule/route cleanup in case PreDown didn't run
+  # stop + remove the guard (which owns the fwmark rule + blackhole floor)
+  if have_systemd; then
+    systemctl disable --now "$GUARD_UNIT" >/dev/null 2>&1 || true
+  elif [ -x /usr/local/sbin/warp-egress-guard ]; then
+    /usr/local/sbin/warp-egress-guard down 2>/dev/null || true
+  fi
+  rm -f "$GUARD_PATH" /usr/local/sbin/warp-egress-guard
+  have_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
+  # belt-and-suspenders rule/route cleanup in case the guard didn't run
   ip -4 rule del fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO" 2>/dev/null || true
   ip -6 rule del fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO" 2>/dev/null || true
   ip route flush table "$TABLE" 2>/dev/null || true
+  ip -6 route flush table "$TABLE" 2>/dev/null || true
   do_dns_off || true
   rm -f "$SYSCTL_FILE"; sysctl --system >/dev/null 2>&1 || true
   ok "WARP egress removed. (kept $WG_CONF and $WGCF_DIR — delete manually to fully purge)"

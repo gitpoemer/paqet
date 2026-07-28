@@ -16,7 +16,7 @@ func (s *Server) handleUDPProtocol(ctx context.Context, strm tnet.Strm, p *proto
 }
 
 func (s *Server) handleUDP(ctx context.Context, strm tnet.Strm, addr string) error {
-	dialer := egressDialer(8*time.Second, s.cfg.Transport.EgressMark)
+	dialer := egressDialer(8*time.Second, int(s.cfg.Transport.EgressMark))
 	conn, err := dialer.DialContext(ctx, "udp", addr)
 	if err != nil {
 		flog.Errorf("failed to establish UDP connection to %s for stream %d: %v", addr, strm.SID(), err)
