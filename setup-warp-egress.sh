@@ -78,7 +78,9 @@ detect_pkg_mgr() {
 pkg_install() {
   # $@ = package names
   case "$PKG" in
-    apt)    apt-get update -qq && apt-get install -y "$@" ;;
+    apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+              && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                   -o Dpkg::Options::=--force-confold "$@" ;;
     dnf)    dnf install -y "$@" ;;
     yum)    yum install -y "$@" ;;
     pacman) pacman -Sy --noconfirm "$@" ;;
@@ -117,14 +119,15 @@ install_wgcf() {
     armv7l|armv7)  arch=armv7 ;;
     *) die "unsupported arch for wgcf: $(uname -m)" ;;
   esac
-  ver=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest \
+  info "resolving latest wgcf version from GitHub ..."
+  ver=$(curl -fsSL --max-time 20 https://api.github.com/repos/ViRb3/wgcf/releases/latest \
         | grep -oE '"tag_name":[[:space:]]*"v[^"]+"' | grep -oE 'v[0-9.]+' | head -1 | tr -d v) \
-    || die "could not resolve latest wgcf version (GitHub API rate limit? set it manually)"
-  [ -n "$ver" ] || die "empty wgcf version from GitHub API"
+    || die "could not resolve latest wgcf version (GitHub API timeout/rate limit)"
+  [ -n "$ver" ] || die "empty wgcf version from GitHub API (rate limited?)"
   url="https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
   tmp=$(mktemp)
   info "downloading wgcf ${ver} (${arch}) ..."
-  curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; die "wgcf download failed: $url"; }
+  curl -fSL --max-time 120 "$url" -o "$tmp" || { rm -f "$tmp"; die "wgcf download failed (timeout?): $url"; }
   install -m 0755 "$tmp" /usr/local/bin/wgcf
   rm -f "$tmp"
   command -v wgcf >/dev/null 2>&1 || die "wgcf install verification failed"
@@ -135,13 +138,20 @@ wgcf_profile() {
   mkdir -p "$WGCF_DIR"; chmod 700 "$WGCF_DIR"
   ( cd "$WGCF_DIR"
     if [ ! -f wgcf-account.toml ]; then
-      info "registering a new WARP account (free) ..."
-      wgcf register --accept-tos || die "wgcf register failed (network?)"
+      info "registering a new WARP account with Cloudflare (network, ~5-30s) ..."
+      if timeout 60 wgcf register --accept-tos </dev/null; then
+        ok "WARP account registered"
+      else
+        rc=$?
+        [ "$rc" -eq 124 ] && die "wgcf register timed out after 60s (network/Cloudflare unreachable?)"
+        die "wgcf register failed (rc=$rc)"
+      fi
     else
       info "reusing existing WARP account (wgcf-account.toml)"
     fi
     if [ ! -f wgcf-profile.conf ]; then
-      wgcf generate || die "wgcf generate failed"
+      info "generating WireGuard profile ..."
+      timeout 30 wgcf generate </dev/null || die "wgcf generate failed"
     fi
   )
   [ -f "$WGCF_DIR/wgcf-profile.conf" ] || die "wgcf-profile.conf not produced"
